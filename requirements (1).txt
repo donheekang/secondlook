@@ -1,7 +1,0 @@
-fastapi>=0.110.0
-uvicorn[standard]>=0.24.0
-httpx>=0.26.0
-cachetools>=5.3.0
-pydantic>=2.6.0
-google-genai>=1.0.0
-pykrx>=1.0.0

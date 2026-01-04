@@ -25,7 +25,7 @@ Endpoints
 •⁠  ⁠ENABLE_KR (default: 1)
 """
 
-from _future_ import annotations
+from __future__ import annotations
 
 import asyncio
 import datetime as dt

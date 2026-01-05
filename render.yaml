@@ -1,42 +1,15 @@
 services:
   - type: web
-    name: secondlook-api
-    runtime: python
+    name: secondlook
+    env: python
     plan: free
-    region: oregon
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: GEMINI_API_KEY
         sync: false
       - key: GEMINI_MODEL
-        value: gemini-2.5-flash
-      - key: CACHE_TTL_SECONDS
-        value: "86400"
-      - key: ALLOW_CLIENT_PREMIUM
-        value: "1"
-    envVarGroups:
-      - secondlook-shared
-
-  - type: cron
-    name: secondlook-symbol-update
-    runtime: python
-    schedule: "0 0 * * *"
-    plan: starter
-    region: oregon
-    buildCommand: pip install -r requirements.txt
-    startCommand: python scripts/cron_update.py
-    envVars:
-      - key: API_BASE
-        fromService:
-          name: secondlook-api
-          type: web
-          envVarKey: RENDER_EXTERNAL_URL
-    envVarGroups:
-      - secondlook-shared
-
-envVarGroups:
-  - name: secondlook-shared
-    envVars:
-      - key: ADMIN_TOKEN
-        generateValue: true
+        value: gemini-3-flash-preview
+      # 선택: 엔드포인트 보호
+      # - key: THE_SHORT_CLIENT_KEY
+      #   sync: false

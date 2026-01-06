@@ -967,7 +967,7 @@ async def deep_report(req: DeepReportRequest):
     asset = infer_asset(req.asset, ticker)
     return await run_deep(asset, ticker, company, conviction_norm, req.force_refresh)
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("main:app", host="0.0.0.0", port=port)

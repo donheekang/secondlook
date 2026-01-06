@@ -1,67 +1,40 @@
-# main.py
-# ============================================================
-# SecondLook / THE SHORT — FastAPI Backend (Render-ready)
-# - POST /analyze     : 1개 블라인드스팟 + 질문 3개 + 출처
-# - POST /deep-report : 반대근거 3~5개 + 질문 3개 + 출처
-# - 24h in-memory TTL cache (same payload -> no extra AI cost)
-# - Optional Serper search for real URLs (SERPER_API_KEY)
-# - Optional Gemini generation (GEMINI_API_KEY)
-#
-# ✅ No "requests" dependency (uses urllib from stdlib)
-# ✅ Won't crash on boot if env vars missing (safe fallback)
-# ============================================================
-
-from __future__ import annotations
-
 import os
-import re
 import json
 import time
 import hashlib
+import logging
 import threading
-from datetime import datetime, timedelta, timezone
-from typing import Any, Optional, Literal, List, Dict, Tuple
+from datetime import datetime, timezone
 from collections import OrderedDict
-from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
+from typing import Any, Dict, List, Optional, Tuple, Literal
 
-from fastapi import FastAPI, HTTPException
+import httpx
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+# =========================================================
+# THE SHORT Backend (Render-friendly)
+# - FastAPI + httpx
+# - 24h in-memory TTL cache
+# - Serper search (optional) for sources
+# - Gemini generate (optional) for AI
+# - Never crash on startup because of missing deps/keys
+# =========================================================
 
-# -----------------------------
-# Config
-# -----------------------------
-SERVICE_NAME = "secondlook"
-PROMPT_VERSION = os.getenv("PROMPT_VERSION", "A1")
-
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "86400"))  # 24h default
-CACHE_MAX_ITEMS = int(os.getenv("CACHE_MAX_ITEMS", "5000"))
-
-ENABLE_SEARCH = os.getenv("ENABLE_SEARCH", "true").lower() in ("1", "true", "yes", "y")
-SERPER_API_KEY = os.getenv("SERPER_API_KEY")  # optional
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # optional
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.0-flash")  # user preference
-GEMINI_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.4"))
-
-DEFAULT_LOCALE = os.getenv("DEFAULT_LOCALE", "ko-KR")
+# -----------------------
+# Logging
+# -----------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("the-short")
 
 
-# KST timezone (Korea Standard Time)
-KST = timezone(timedelta(hours=9))
-
-
-# -----------------------------
-# TTL Cache (fixes your error)
-# -----------------------------
+# -----------------------
+# TTL Memory Cache (FIXED: accepts args)
+# -----------------------
 class TTLMemoryCache:
-    """
-    - ttl_seconds 동안 캐시 유지
-    - max_items 초과하면 오래된 것부터 제거
-    - in-memory라 Render free 인스턴스 스핀다운되면 캐시 증발(정상)
-    """
     def _init_(self, ttl_seconds: int = 86400, max_items: int = 5000):
         self.ttl_seconds = int(ttl_seconds)
         self.max_items = int(max_items)
@@ -100,640 +73,622 @@ class TTLMemoryCache:
             }
 
 
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "86400"))  # 24h default
+CACHE_MAX_ITEMS = int(os.getenv("CACHE_MAX_ITEMS", "5000"))
 cache = TTLMemoryCache(ttl_seconds=CACHE_TTL_SECONDS, max_items=CACHE_MAX_ITEMS)
 
 
-# -----------------------------
-# Models
-# -----------------------------
-Asset = Literal["US", "KR", "COIN"]
+# -----------------------
+# Env / Config
+# -----------------------
+# iOS 앱 ↔️ 서버 간 간단 인증키 (선택)
+SERVER_API_KEY = os.getenv("SERVER_API_KEY", "").strip()
+# Serper (구글 검색 API) - 출처 리스트 만들 때 사용 (선택)
+SERPER_API_KEY = os.getenv("SERPER_API_KEY", "").strip()
 
-class AnalyzePayload(BaseModel):
-    asset: Asset
-    ticker: str = Field(min_length=1, max_length=32)
-    company: str = Field(default="", max_length=128)
-    conviction: str = Field(min_length=3, max_length=500)
-    locale: str = Field(default=DEFAULT_LOCALE, max_length=16)
-    forceRefresh: bool = False
+# Gemini API key (필수로 쓰고 싶으면 넣어야 함)
+# 구글 키 이름이 GOOGLE_API_KEY 인 경우도 있어서 둘 다 지원
+GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")).strip()
 
+# 모델명은 네가 Render env로 바꿀 수 있게 열어둠
+GEMINI_MODEL_ANALYZE = os.getenv("GEMINI_MODEL_ANALYZE", os.getenv("GEMINI_MODEL", "gemini-3.0-flash")).strip()
+GEMINI_MODEL_DEEP = os.getenv("GEMINI_MODEL_DEEP", os.getenv("GEMINI_MODEL", "gemini-3.0-flash")).strip()
 
-class SourceItem(BaseModel):
-    title: str
-    url: str
-    publisher: Optional[str] = None
-    snippet: Optional[str] = None
+# Generative Language API (기본은 v1beta)
+GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta").strip()
 
+SERPER_ENDPOINT = os.getenv("SERPER_ENDPOINT", "https://google.serper.dev/search").strip()
 
-class BlindspotOut(BaseModel):
-    severity: Literal["low", "medium", "high"]
-    title: str
-    valueLine: str
-    detail: str
+# CORS (웹 디버깅용; iOS 앱은 보통 필요 없지만 열어둠)
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").strip()
 
 
-class AnalyzeResponse(BaseModel):
-    ok: bool
-    cached: bool
-    asOfISO: str
-    asOfKorean: str
-    selection: Dict[str, str]
-    conviction: str
-    blindspot: BlindspotOut
-    questions: List[str]
-    sources: List[SourceItem]
-    disclaimer: str
-
-
-class CounterEvidence(BaseModel):
-    severity: Literal["low", "medium", "high"]
-    title: str
-    fact: str
-    whyItMatters: str
-    sources: List[SourceItem]
-
-
-class DeepReportResponse(BaseModel):
-    ok: bool
-    cached: bool
-    asOfISO: str
-    asOfKorean: str
-    selection: Dict[str, str]
-    conviction: str
-    summary: str
-    counterEvidence: List[CounterEvidence]
-    questions: List[str]
-    sources: List[SourceItem]
-    disclaimer: str
-
-
-# -----------------------------
+# -----------------------
 # FastAPI App
-# -----------------------------
-app = FastAPI(title="SecondLook API", version="1.0.0")
+# -----------------------
+app = FastAPI(title="The Short API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # iOS app 호출 편의
+    allow_origins=[""] if ALLOWED_ORIGINS == "" else [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# -----------------------------
-# Helpers: date formatting
-# -----------------------------
-def now_kst() -> datetime:
-    return datetime.now(tz=KST)
-
-def iso_kst(dt: datetime) -> str:
-    return dt.isoformat()
-
-def korean_datetime(dt: datetime) -> str:
-    # 예: 2026년 1월 6일 오전 8:54
-    hour = dt.hour
-    ampm = "오전" if hour < 12 else "오후"
-    h12 = hour % 12
-    if h12 == 0:
-        h12 = 12
-    return f"{dt.year}년 {dt.month}월 {dt.day}일 {ampm} {h12}:{dt.minute:02d}"
+_http: Optional[httpx.AsyncClient] = None
 
 
-# -----------------------------
-# Helpers: cache key
-# -----------------------------
-def _normalize_text(s: str) -> str:
-    s = s.strip()
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-def make_cache_key(endpoint: str, payload: AnalyzePayload) -> str:
-    base = {
-        "endpoint": endpoint,
-        "prompt_version": PROMPT_VERSION,
-        "asset": payload.asset,
-        "ticker": _normalize_text(payload.ticker).upper(),
-        "company": _normalize_text(payload.company),
-        "conviction": _normalize_text(payload.conviction),
-        "locale": payload.locale,
-        "model": GEMINI_MODEL,
-        "temp": GEMINI_TEMPERATURE,
-        "search": bool(ENABLE_SEARCH and SERPER_API_KEY),
-    }
-    raw = json.dumps(base, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
+@app.on_event("startup")
+async def _startup() -> None:
+    global _http
+    _http = httpx.AsyncClient(
+        timeout=httpx.Timeout(30.0, connect=10.0),
+        headers={"User-Agent": "the-short/1.0"},
+    )
+    logger.info("startup ok")
 
 
-# -----------------------------
-# HTTP JSON (stdlib)
-# -----------------------------
-def http_post_json(url: str, headers: Dict[str, str], body: Dict[str, Any], timeout: int = 15) -> Dict[str, Any]:
-    data = json.dumps(body).encode("utf-8")
-    req = Request(url, data=data, headers={**headers, "Content-Type": "application/json"}, method="POST")
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    global _http
+    if _http:
+        await _http.aclose()
+    _http = None
+    logger.info("shutdown ok")
+
+
+# -----------------------
+# Models
+# -----------------------
+AssetType = Literal["US", "KR", "COIN"]
+SeverityType = Literal["LOW", "MED", "HIGH"]
+
+
+class AnalyzePayload(BaseModel):
+    asset: AssetType = Field(..., description="US | KR | COIN")
+    ticker: str = Field(..., min_length=1, max_length=20)
+    company: Optional[str] = Field(None, max_length=80)
+    conviction: str = Field(..., min_length=3, max_length=300)
+    locale: str = Field("ko-KR")
+    forceRefresh: bool = Field(False)
+
+
+class SourceItem(BaseModel):
+    title: str
+    url: str
+    domain: str
+
+
+class Blindspot(BaseModel):
+    title: str
+    valueLine: str
+    detail: str
+    severity: SeverityType
+
+
+class AnalyzeResponse(BaseModel):
+    asOf: str
+    cached: bool
+    asset: AssetType
+    ticker: str
+    company: Optional[str]
+    conviction: str
+    blindspot: Blindspot
+    questions: List[str]
+    sources: List[SourceItem]
+
+
+class DeepPayload(BaseModel):
+    asset: AssetType
+    ticker: str
+    company: Optional[str] = None
+    conviction: str
+    locale: str = "ko-KR"
+    forceRefresh: bool = False
+
+
+class CounterItem(BaseModel):
+    category: str
+    headline: str
+    evidence: str
+    numbers: List[Dict[str, str]] = []
+    source_refs: List[int] = []  # sources index 참조
+
+
+class DeepReportResponse(BaseModel):
+    asOf: str
+    cached: bool
+    asset: AssetType
+    ticker: str
+    company: Optional[str]
+    conviction: str
+    summary: str
+    counters: List[CounterItem]
+    questions: List[str]
+    sources: List[SourceItem]
+
+
+# -----------------------
+# Helpers
+# -----------------------
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def normalize_text(s: str, max_len: int = 400) -> str:
+    s = (s or "").strip()
+    s = " ".join(s.split())
+    return s[:max_len]
+
+
+def safe_domain(url: str) -> str:
     try:
-        with urlopen(req, timeout=timeout) as resp:
-            payload = resp.read().decode("utf-8")
-            return json.loads(payload)
-    except HTTPError as e:
-        detail = e.read().decode("utf-8") if hasattr(e, "read") else str(e)
-        raise RuntimeError(f"HTTPError {e.code}: {detail}")
-    except URLError as e:
-        raise RuntimeError(f"URLError: {e}")
-    except Exception as e:
-        raise RuntimeError(str(e))
+        u = httpx.URL(url)
+        return (u.host or "").lower()
+    except Exception:
+        return ""
 
 
-# -----------------------------
-# Search (Serper optional)
-# -----------------------------
-def serper_search(query: str, k: int = 6) -> List[SourceItem]:
-    """
-    Serper Google Search API
-    - env: SERPER_API_KEY
-    - returns top organic results (title, link, snippet)
-    """
-    if not (ENABLE_SEARCH and SERPER_API_KEY):
+def make_cache_key(prefix: str, payload_dict: Dict[str, Any]) -> str:
+    # forceRefresh는 캐시 키에서 제외 (동일 입력이면 같은 키)
+    d = {k: v for k, v in payload_dict.items() if k != "forceRefresh"}
+    raw = json.dumps(d, ensure_ascii=False, sort_keys=True)
+    h = hashlib.sha256((prefix + "|" + raw).encode("utf-8")).hexdigest()
+    return h
+
+
+def extract_first_json(text: str) -> Dict[str, Any]:
+    # Gemini가 ⁠ json  ⁠으로 감싸도 그냥 첫 { ... }만 뽑아 파싱
+    if not text:
+        raise ValueError("empty")
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        raise ValueError("no json object")
+    snippet = text[start : end + 1]
+    return json.loads(snippet)
+
+
+def require_server_key(x_api_key: Optional[str]) -> None:
+    # SERVER_API_KEY를 설정한 경우에만 체크 (설정 안 하면 오픈)
+    if not SERVER_API_KEY:
+        return
+    if not x_api_key or x_api_key.strip() != SERVER_API_KEY:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+
+# -----------------------
+# Serper Search (optional)
+# -----------------------
+def build_search_query(asset: AssetType, ticker: str, company: Optional[str], conviction: str) -> str:
+    base = ticker
+    if company and company.lower() != "unknown":
+        base += f" {company}"
+
+    conviction = normalize_text(conviction, 120)
+
+    if asset == "COIN":
+        # 코인은 이 키워드들이 출처 뽑기에 잘 먹힘
+        return f"{base} token unlock schedule circulating supply FDV {conviction}"
+    if asset == "KR":
+        return f"{base} 실적 리스크 경쟁 규제 밸류에이션 {conviction}"
+    # US
+    return f"{base} earnings risk competition regulation valuation {conviction}"
+
+
+def locale_to_serper(locale: str, asset: AssetType) -> Tuple[str, str]:
+    # hl: language, gl: country
+    # 한국 사용자 기준으로 hl=ko 유지하되, US는 gl=us로 소스 폭을 넓힘
+    hl = "ko" if locale.lower().startswith("ko") else "en"
+    if asset == "US":
+        return hl, "us"
+    if asset == "KR":
+        return hl, "kr"
+    return hl, "us"
+
+
+async def serper_search_sources(query: str, hl: str, gl: str, num: int = 5) -> List[SourceItem]:
+    if not SERPER_API_KEY:
+        return []
+    if not _http:
         return []
 
-    url = "https://google.serper.dev/search"
-    headers = {"X-API-KEY": SERPER_API_KEY}
-    body = {"q": query, "num": k}
-
-    out = http_post_json(url, headers=headers, body=body, timeout=20)
-    items: List[SourceItem] = []
-
-    organic = out.get("organic", []) or []
-    for r in organic[:k]:
-        title = str(r.get("title") or "").strip()
-        link = str(r.get("link") or "").strip()
-        snippet = str(r.get("snippet") or "").strip()
-        if title and link:
-            items.append(SourceItem(title=title, url=link, snippet=snippet))
-
-    return items
-
-
-def source_fallback_candidates(asset: Asset, ticker: str, company: str) -> List[SourceItem]:
-    """
-    Serper 없을 때라도 UI에 '출처 후보'를 보여줄 수 있게 하는 안전한 기본 링크들.
-    (구체 숫자/사실은 여기서 검증 불가 → LLM에도 "숫자 만들지 말라" 강제)
-    """
-    t = ticker.upper().strip()
-    c = company.strip() or "Unknown"
-
-    if asset == "US":
-        return [
-            SourceItem(title="SEC EDGAR Search", url="https://www.sec.gov/edgar/search/"),
-            SourceItem(title=f"{t} Investor Relations (검색)", url=f"https://www.google.com/search?q={t}+investor+relations"),
-            SourceItem(title="NASDAQ Market Activity", url="https://www.nasdaq.com/market-activity"),
-        ]
-    if asset == "KR":
-        return [
-            SourceItem(title="DART 전자공시", url="https://dart.fss.or.kr/"),
-            SourceItem(title="KRX 정보데이터시스템", url="https://data.krx.co.kr/"),
-            SourceItem(title=f"{c} 뉴스/공시(검색)", url=f"https://www.google.com/search?q={c}+공시+실적"),
-        ]
-    # COIN
-    return [
-        SourceItem(title="CoinMarketCap", url="https://coinmarketcap.com/"),
-        SourceItem(title="CoinGecko", url="https://www.coingecko.com/"),
-        SourceItem(title="TokenUnlocks", url="https://token.unlocks.app/"),
-    ]
-
-
-def build_search_queries(asset: Asset, ticker: str, company: str) -> List[str]:
-    t = ticker.strip()
-    c = company.strip()
-
-    if asset == "US":
-        return [
-            f"{t} {c} earnings risk margin competition regulation",
-            f"{t} {c} valuation multiple downside bear case",
-        ]
-    if asset == "KR":
-        # 한국어 쿼리 섞기
-        base = c if c else t
-        return [
-            f"{base} 실적 리스크 마진 경쟁 규제 악재",
-            f"{base} 밸류에이션 고평가 저평가 논란 PER PBR",
-        ]
-    # COIN
-    return [
-        f"{t} token unlock schedule inflation circulating supply",
-        f"{t} regulatory risk investigation fine ban",
-    ]
-
-
-# -----------------------------
-# Gemini (optional)
-# -----------------------------
-def gemini_ready() -> bool:
-    return bool(GEMINI_API_KEY)
-
-def call_gemini_json(system: str, user: str) -> Optional[Dict[str, Any]]:
-    """
-    Returns dict parsed from model output (must be JSON).
-    If Gemini not configured or output invalid -> None.
-    """
-    if not GEMINI_API_KEY:
-        return None
-
     try:
-        import google.generativeai as genai  # type: ignore
-        genai.configure(api_key=GEMINI_API_KEY)
+        headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
+        body = {"q": query, "hl": hl, "gl": gl, "num": num}
+        r = await _http.post(SERPER_ENDPOINT, headers=headers, json=body)
+        r.raise_for_status()
+        data = r.json()
+        organic = data.get("organic", []) or []
+        out: List[SourceItem] = []
+        for it in organic[:num]:
+            url = it.get("link") or ""
+            title = it.get("title") or ""
+            if not url or not title:
+                continue
+            out.append(SourceItem(title=title[:140], url=url, domain=safe_domain(url)))
+        return out
+    except Exception as e:
+        logger.warning(f"serper failed: {e}")
+        return []
 
-        model = genai.GenerativeModel(
-            model_name=GEMINI_MODEL,
-            system_instruction=system,
-        )
 
-        resp = model.generate_content(
-            user,
-            generation_config={
-                "temperature": GEMINI_TEMPERATURE,
-            },
-        )
+# -----------------------
+# Gemini (optional)
+# -----------------------
+def system_prompt_ko() -> str:
+    # 말투: 차갑고 단정. 욕설/비하 금지.
+    return (
+        "너는 '더 쇼트(The Short)'의 데이터 검증관이다.\n"
+        "- 목표: 사용자의 투자 논리에서 가장 취약한 전제 1개를 '팩트 중심'으로 찌른다.\n"
+        "- 톤: 차갑고 단정, 짧고 강하다. 하지만 욕설/비하/혐오 표현은 금지.\n"
+        "- 출처가 제공되면, 그 범위 내에서만 추론하고 과장은 하지 마라.\n"
+        "- 결과는 반드시 JSON만 출력한다(마크다운/설명 금지).\n"
+    )
 
-        text = getattr(resp, "text", None) or ""
-        text = text.strip()
 
-        # Extract JSON (model sometimes wraps with fences)
-        # Find first '{' and last '}'.
-        i = text.find("{")
-        j = text.rfind("}")
-        if i == -1 or j == -1 or j <= i:
-            return None
-        js = text[i : j + 1]
+def build_analyze_prompt(payload: AnalyzePayload, sources: List[SourceItem]) -> str:
+    src_lines = []
+    for i, s in enumerate(sources):
+        src_lines.append(f"[{i}] {s.title} ({s.domain}) {s.url}")
 
-        return json.loads(js)
+    src_block = "\n".join(src_lines) if src_lines else "(no sources provided)"
 
+    return (
+        f"{system_prompt_ko()}\n"
+        "다음 입력을 분석하라.\n"
+        f"- asset: {payload.asset}\n"
+        f"- ticker: {payload.ticker}\n"
+        f"- company: {payload.company or 'Unknown'}\n"
+        f"- conviction: {payload.conviction}\n\n"
+        "가능하면 아래 '출처 목록'에서 근거 힌트를 사용하라.\n"
+        f"출처 목록:\n{src_block}\n\n"
+        "아래 스키마로 JSON만 출력:\n"
+        "{\n"
+        '  "blindspot": {\n'
+        '    "title": "짧은 제목",\n'
+        '    "valueLine": "강한 한 줄 팩트/경고",\n'
+        '    "detail": "2~4문장 설명(과장 금지)",\n'
+        '    "severity": "LOW|MED|HIGH"\n'
+        "  },\n"
+        '  "questions": ["질문1", "질문2", "질문3"]\n'
+        "}\n"
+    )
+
+
+def build_deep_prompt(payload: DeepPayload, sources: List[SourceItem]) -> str:
+    src_lines = []
+    for i, s in enumerate(sources):
+        src_lines.append(f"[{i}] {s.title} ({s.domain}) {s.url}")
+    src_block = "\n".join(src_lines) if src_lines else "(no sources provided)"
+
+    return (
+        f"{system_prompt_ko()}\n"
+        "다음 입력을 기반으로 '심층 반격 리포트'를 작성하라.\n"
+        "- 요구사항:\n"
+        "  1) 반대 근거 3~5개 (수요/마진/경쟁/규제/밸류에이션 중 최소 3범주)\n"
+        "  2) 각 근거는 headline(짧게) + evidence(2~4문장) + numbers(있으면) + source_refs(출처 index)\n"
+        "  3) 마지막에 날카로운 질문 3개\n"
+        "  4) 욕설/비하/혐오 금지. 단정하고 냉정.\n\n"
+        f"- asset: {payload.asset}\n"
+        f"- ticker: {payload.ticker}\n"
+        f"- company: {payload.company or 'Unknown'}\n"
+        f"- conviction: {payload.conviction}\n\n"
+        f"출처 목록:\n{src_block}\n\n"
+        "아래 스키마로 JSON만 출력:\n"
+        "{\n"
+        '  "summary": "2~3문장 요약",\n'
+        '  "counters": [\n'
+        "    {\n"
+        '      "category": "수요|마진|경쟁|규제|밸류에이션",\n'
+        '      "headline": "짧고 강한 한 줄",\n'
+        '      "evidence": "2~4문장",\n'
+        '      "numbers": [{"label":"", "value":""}],\n'
+        '      "source_refs": [0,1]\n'
+        "    }\n"
+        "  ],\n"
+        '  "questions": ["질문1", "질문2", "질문3"]\n'
+        "}\n"
+    )
+
+
+async def gemini_generate(model: str, prompt: str) -> str:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("missing GEMINI_API_KEY (or GOOGLE_API_KEY)")
+    if not _http:
+        raise RuntimeError("http client not ready")
+
+    url = f"{GEMINI_BASE_URL}/models/{model}:generateContent"
+    params = {"key": GEMINI_API_KEY}
+
+    body = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt}],
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.4,
+            "maxOutputTokens": 900,
+        },
+    }
+
+    r = await _http.post(url, params=params, json=body)
+    if r.status_code >= 400:
+        raise RuntimeError(f"gemini http {r.status_code}: {r.text[:300]}")
+    data = r.json()
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"]
     except Exception:
-        # Don't crash server on AI error
-        return None
+        raise RuntimeError("gemini response parse failed")
 
 
-# -----------------------------
-# Prompt slots (A1)
-# -----------------------------
-def system_prompt_common() -> str:
-    return (
-        "너는 '더쇼트(The Short)'의 반대근거 엔진이다.\n"
-        "목표: 사용자의 매수/보유 논리를 '팩트와 리스크'로 검증한다.\n"
-        "톤: 차갑고 단정적. 하지만 욕설/비하/인신공격 금지. 사람을 치지 말고 논리를 친다.\n"
-        "팩트 규칙:\n"
-        "- 숫자를 말할 때는 주어진 SOURCES 안에서 근거가 보일 때만 사용한다.\n"
-        "- 근거가 불충분하면 숫자를 꾸미지 말고 '확인 필요'로 처리한다.\n"
-        "- 출처 URL은 반드시 SOURCES에 있는 링크만 사용한다(새로 만들어내지 마라).\n"
-        "출력 규칙:\n"
-        "- 반드시 '오직 JSON'만 출력한다. 설명 텍스트, 마크다운, 코드블록 금지.\n"
-    )
-
-def user_prompt_analyze(payload: AnalyzePayload, sources: List[SourceItem]) -> str:
-    sel = {"asset": payload.asset, "ticker": payload.ticker, "company": payload.company}
-    return (
-        f"INPUT\n"
-        f"- selection: {json.dumps(sel, ensure_ascii=False)}\n"
-        f"- conviction: {payload.conviction}\n"
-        f"- locale: {payload.locale}\n\n"
-        f"SOURCES (use only these URLs)\n"
-        f"{json.dumps([s.model_dump() for s in sources], ensure_ascii=False)}\n\n"
-        f"OUTPUT JSON SCHEMA\n"
-        f"{{\n"
-        f'  "blindspot": {{"severity":"low|medium|high","title":"...","valueLine":"...","detail":"..."}},\n'
-        f'  "questions": ["...","...","..."],\n'
-        f'  "sources": [{{"title":"...","url":"...","publisher":"optional","snippet":"optional"}}]\n'
-        f"}}\n\n"
-        f"RULES\n"
-        f"- blindspot은 1개만. 가장 치명적인 전제 누락/리스크를 한 방으로.\n"
-        f"- valueLine은 '한 줄 팩트/리스크'로 짧고 강하게.\n"
-        f"- questions는 3개. 회피 못 하게 '조건/수치/손절/검증지표'를 묻는다.\n"
-        f"- sources는 최대 3개. 반드시 위 SOURCES 안에서만 선택.\n"
-    )
-
-def user_prompt_deep(payload: AnalyzePayload, sources: List[SourceItem]) -> str:
-    sel = {"asset": payload.asset, "ticker": payload.ticker, "company": payload.company}
-    return (
-        f"INPUT\n"
-        f"- selection: {json.dumps(sel, ensure_ascii=False)}\n"
-        f"- conviction: {payload.conviction}\n"
-        f"- locale: {payload.locale}\n\n"
-        f"SOURCES (use only these URLs)\n"
-        f"{json.dumps([s.model_dump() for s in sources], ensure_ascii=False)}\n\n"
-        f"OUTPUT JSON SCHEMA\n"
-        f"{{\n"
-        f'  "summary": "...",\n'
-        f'  "counterEvidence": [\n'
-        f'    {{"severity":"low|medium|high","title":"...","fact":"...","whyItMatters":"...","sources":[{{"title":"...","url":"...","publisher":"optional","snippet":"optional"}}]}},\n'
-        f'    ... (3~5 items)\n'
-        f'  ],\n'
-        f'  "questions": ["...","...","..."],\n'
-        f'  "sources": [{{"title":"...","url":"...","publisher":"optional","snippet":"optional"}}]\n'
-        f"}}\n\n"
-        f"RULES\n"
-        f"- counterEvidence는 3~5개. 서로 다른 축(수요/마진/경쟁/규제/밸류/공급)을 섞어라.\n"
-        f"- fact는 '짧고 단정적'. 숫자가 필요하면 SOURCES snippet에 근거가 있을 때만.\n"
-        f"- whyItMatters는 1~2문장. 이게 왜 가격/리스크로 이어지는지.\n"
-        f"- sources는 각 evidence당 1~2개. 전체 sources는 최대 5개.\n"
-        f"- URL은 반드시 SOURCES에서만.\n"
-    )
-
-
-# -----------------------------
-# Fallback (no Gemini / parse fail)
-# -----------------------------
-def heuristic_blindspot(conviction: str) -> BlindspotOut:
-    low = conviction.lower()
-    if any(k in low for k in ["매출", "성장", "수요", "users", "사용자", "daU".lower()]):
-        return BlindspotOut(
-            severity="high",
-            title="성장 서사가 '이익/현금흐름'으로 연결되는 구간이 비어있음",
-            valueLine="매출↑는 주가↑가 아니다. 마진/현금흐름이 꺾이면 시나리오는 끝난다.",
-            detail="성장은 비용·가격경쟁·경기·규제 앞에서 먼저 흔들립니다. '언제/어떤 지표로 확인할지'가 없으면 확신이 아니라 추정입니다.",
+# -----------------------
+# Fallback (no AI / AI failed)
+# -----------------------
+def fallback_short(payload: AnalyzePayload, sources: List[SourceItem]) -> AnalyzeResponse:
+    c = normalize_text(payload.conviction, 220).lower()
+    if any(k in c for k in ["매출", "성장", "수요"]):
+        blind = Blindspot(
+            title="수요 성장 = 이익 성장? (가정 누락)",
+            valueLine="매출↑는 이익↑가 아닙니다. 마진이 꺾이면 시나리오는 끝납니다.",
+            detail="성장 스토리는 비용/가격/경쟁 앞에서 먼저 흔들립니다. ‘얼마나 벌 수 있는가’가 빠지면 확신은 방어력이 없습니다.",
+            severity="HIGH",
         )
-    if any(k in low for k in ["저평가", "밸류", "per", "p/e", "pbr", "undervalued"]):
-        return BlindspotOut(
-            severity="medium",
-            title="저평가가 아니라 '정당한 할인'일 수 있음",
-            valueLine="싸서 오르는 게 아니라, 싫어할 이유가 사라져야 오른다.",
-            detail="멀티플은 자동복구가 아닙니다. 경쟁/규제/수익성 같은 할인 요인이 유지되면 평균회귀는 오지 않습니다.",
+    elif any(k in c for k in ["저평가", "밸류", "per", "p/e"]):
+        blind = Blindspot(
+            title="저평가가 아니라 ‘정당한 할인’",
+            valueLine="싸서 오르는 게 아니라, ‘싫어할 이유’가 사라져야 오릅니다.",
+            detail="멀티플은 선물이 아닙니다. 할인 요인이 유지되면 평균회귀는 오지 않습니다.",
+            severity="MED",
         )
-    if any(k in low for k in ["독점", "moat", "해자", "점유율", "경쟁"]):
-        return BlindspotOut(
-            severity="high",
-            title="해자의 본질은 점유율이 아니라 '가격 결정력'",
-            valueLine="가격을 못 지키면 해자는 무너진다.",
-            detail="경쟁이 가격으로 들어오면 점유율은 남아도 수익성이 먼저 깨집니다. '가격을 올릴 수 있는 이유'가 문장에 없습니다.",
+    elif any(k in c for k in ["독점", "경쟁", "moat", "점유율"]):
+        blind = Blindspot(
+            title="해자(Moat)의 본질",
+            valueLine="점유율이 아니라 ‘가격 결정력’이 무너지면 끝입니다.",
+            detail="경쟁이 가격으로 들어오면 해자는 생각보다 빨리 무너집니다. ‘가격을 지킬 이유’가 문장에 없습니다.",
+            severity="HIGH",
         )
-    return BlindspotOut(
-        severity="medium",
-        title="핵심 전제가 문장에 없음",
-        valueLine="'왜 지금'과 '언제까지'가 비어있다.",
-        detail="좋은 논리는 시간과 조건을 포함합니다. 지금 문장은 신념에 가깝고, 검증 가능한 조건이 약합니다.",
-    )
+    else:
+        blind = Blindspot(
+            title="핵심 전제가 문장에 없음",
+            valueLine="‘왜 지금’과 ‘언제까지’가 비어있습니다.",
+            detail="좋은 논리는 시간/조건을 포함합니다. 지금 문장은 신념에 가깝고, 검증 가능한 조건이 적습니다.",
+            severity="MED",
+        )
 
-def heuristic_questions() -> List[str]:
-    return [
-        "이 논리가 깨지는 '조건' 1개를 말할 수 있습니까?",
-        "손절 기준(가격/지표)은 무엇입니까? '없다'는 답도 하나의 답입니다.",
-        "다음 분기에 반드시 확인할 '숫자 1개'를 정할 수 있습니까?",
+    questions = [
+        "이 논리가 깨지는 조건 1가지는 무엇입니까?",
+        "실적이 좋아도 주가가 떨어질 수 있는 이유를 말할 수 있습니까?",
+        "다음 분기에 반드시 확인할 ‘숫자’ 1개를 정할 수 있습니까?",
     ]
 
-def disclaimer_text() -> str:
-    return "투자 조언이 아닙니다. 정보 제공 목적이며 최종 판단과 책임은 사용자에게 있습니다."
+    return AnalyzeResponse(
+        asOf=now_iso(),
+        cached=False,
+        asset=payload.asset,
+        ticker=payload.ticker,
+        company=payload.company,
+        conviction=payload.conviction,
+        blindspot=blind,
+        questions=questions,
+        sources=sources,
+    )
 
 
-# -----------------------------
-# Endpoints
-# -----------------------------
-@app.get("/")
-def root():
+def fallback_deep(payload: DeepPayload, sources: List[SourceItem]) -> DeepReportResponse:
+    counters = [
+        CounterItem(
+            category="수요",
+            headline="수요는 ‘좋다’가 아니라 ‘지속’이 핵심입니다.",
+            evidence="수요가 늘어도 경기/금리/경쟁 변수로 꺾일 수 있습니다. ‘어떤 지표로 지속을 확인할지’가 빠지면 논리는 취약합니다.",
+            numbers=[],
+            source_refs=[],
+        ),
+        CounterItem(
+            category="마진",
+            headline="매출이 아니라 마진이 먼저 무너집니다.",
+            evidence="원가/판관비/가격경쟁이 붙는 순간, 매출 성장의 의미가 바뀝니다. 마진 방어 근거가 없으면 리스크가 커집니다.",
+            numbers=[],
+            source_refs=[],
+        ),
+        CounterItem(
+            category="밸류에이션",
+            headline="싸 보이는 건 이유가 있을 때가 많습니다.",
+            evidence="멀티플은 ‘평균’으로 돌아오는 게 아니라, 할인 요인이 제거될 때 움직입니다. 무엇이 해소되면 리레이팅 되는지 정의가 필요합니다.",
+            numbers=[],
+            source_refs=[],
+        ),
+    ]
+
+    questions = [
+        "당신의 논리가 깨지는 조건 1가지를 문장으로 고정할 수 있습니까?",
+        "손절/익절 기준은 가격이 아니라 ‘조건’으로 설명할 수 있습니까?",
+        "다음 분기에 확인할 숫자 1개를 못 정하면, 무엇을 믿고 있습니까?",
+    ]
+
+    return DeepReportResponse(
+        asOf=now_iso(),
+        cached=False,
+        asset=payload.asset,
+        ticker=payload.ticker,
+        company=payload.company,
+        conviction=payload.conviction,
+        summary="논리의 핵심 전제가 ‘조건/지표’로 고정되지 않아 방어력이 낮습니다. 반대 시나리오를 숫자와 출처로 잠그는 단계가 필요합니다.",
+        counters=counters,
+        questions=questions,
+        sources=sources,
+    )
+
+
+# -----------------------
+# Error handler (always JSON)
+# -----------------------
+@app.exception_handler(Exception)
+async def _all_exception_handler(request: Request, exc: Exception):
+    logger.exception(f"unhandled error: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={"error": "internal_error", "message": "Internal Server Error"},
+    )
+
+
+# -----------------------
+# Routes
+# -----------------------
+@app.get("/health")
+async def health():
     return {
         "ok": True,
-        "service": SERVICE_NAME,
-        "version": app.version,
-        "prompt_version": PROMPT_VERSION,
+        "time": now_iso(),
         "cache": cache.stats(),
-        "search_enabled": bool(ENABLE_SEARCH and SERPER_API_KEY),
-        "gemini_ready": gemini_ready(),
-        "model": GEMINI_MODEL,
+        "has_SERVER_API_KEY": bool(SERVER_API_KEY),
+        "has_SERPER_API_KEY": bool(SERPER_API_KEY),
+        "has_GEMINI_API_KEY": bool(GEMINI_API_KEY),
+        "models": {"analyze": GEMINI_MODEL_ANALYZE, "deep": GEMINI_MODEL_DEEP},
     }
 
-@app.get("/health")
-def health():
-    return {"ok": True}
 
+@app.post("/v1/analyze", response_model=AnalyzeResponse)
+async def analyze(payload: AnalyzePayload, x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
+    require_server_key(x_api_key)
 
-@app.post("/analyze", response_model=AnalyzeResponse)
-def analyze(payload: AnalyzePayload):
-    # cache
-    key = make_cache_key("analyze", payload)
+    payload.ticker = normalize_text(payload.ticker, 20).upper()
+    payload.company = normalize_text(payload.company or "Unknown", 80)
+    payload.conviction = normalize_text(payload.conviction, 300)
+
+    ck = make_cache_key("analyze", payload.model_dump())
     if not payload.forceRefresh:
-        hit = cache.get(key)
-        if hit is not None:
-            return AnalyzeResponse(**hit, cached=True)
+        hit = cache.get(ck)
+        if hit:
+            hit["cached"] = True
+            return hit
 
-    # sources (search if possible)
-    sources: List[SourceItem] = []
-    if ENABLE_SEARCH and SERPER_API_KEY:
-        queries = build_search_queries(payload.asset, payload.ticker, payload.company)
-        # cheap: 1 query만 사용(비용/속도)
-        sources = serper_search(queries[0], k=6)
-    if not sources:
-        sources = source_fallback_candidates(payload.asset, payload.ticker, payload.company)
+    # sources (optional)
+    query = build_search_query(payload.asset, payload.ticker, payload.company, payload.conviction)
+    hl, gl = locale_to_serper(payload.locale, payload.asset)
+    sources = await serper_search_sources(query, hl=hl, gl=gl, num=5)
 
-    # Gemini
-    system = system_prompt_common()
-    user = user_prompt_analyze(payload, sources)
+    # AI (optional)
+    try:
+        if GEMINI_API_KEY:
+            prompt = build_analyze_prompt(payload, sources)
+            raw = await gemini_generate(GEMINI_MODEL_ANALYZE, prompt)
+            data = extract_first_json(raw)
 
-    js = call_gemini_json(system=system, user=user)
+            blind = data.get("blindspot") or {}
+            qs = data.get("questions") or []
 
-    # build response
-    dt = now_kst()
-    base = {
-        "ok": True,
-        "cached": False,
-        "asOfISO": iso_kst(dt),
-        "asOfKorean": korean_datetime(dt),
-        "selection": {"asset": payload.asset, "ticker": payload.ticker, "company": payload.company or "Unknown"},
-        "conviction": _normalize_text(payload.conviction),
-        "disclaimer": disclaimer_text(),
-    }
+            resp = AnalyzeResponse(
+                asOf=now_iso(),
+                cached=False,
+                asset=payload.asset,
+                ticker=payload.ticker,
+                company=payload.company,
+                conviction=payload.conviction,
+                blindspot=Blindspot(
+                    title=normalize_text(blind.get("title", "핵심 전제 점검"), 80),
+                    valueLine=normalize_text(blind.get("valueLine", "불편한 사실 1개가 빠져 있습니다."), 120),
+                    detail=normalize_text(blind.get("detail", "전제를 조건과 지표로 고정하지 않으면 논리는 쉽게 흔들립니다."), 500),
+                    severity=(blind.get("severity") or "MED").replace("MEDIUM", "MED").upper(),  # 방어
+                ),
+                questions=[normalize_text(q, 140) for q in (qs[:3] if isinstance(qs, list) else [])] or fallback_short(payload, sources).questions,
+                sources=sources,
+            )
 
-    if isinstance(js, dict):
-        try:
-            blind = BlindspotOut(**js.get("blindspot", {}))
-            questions = js.get("questions") or []
-            if not isinstance(questions, list) or len(questions) < 3:
-                questions = heuristic_questions()
-            else:
-                questions = [str(x) for x in questions[:3]]
+            out = resp.model_dump()
+            cache.set(ck, out)
+            return out
 
-            out_sources = js.get("sources") or []
-            if not isinstance(out_sources, list) or len(out_sources) == 0:
-                out_sources = [s.model_dump() for s in sources[:3]]
-            else:
-                # safety: keep only URLs from allowed sources
-                allowed = {s.url for s in sources}
-                filtered = []
-                for it in out_sources:
+        # no gemini key → fallback
+        resp = fallback_short(payload, sources).model_dump()
+        cache.set(ck, resp)
+        return resp
+
+    except Exception as e:
+        logger.warning(f"analyze ai failed -> fallback: {e}")
+        resp = fallback_short(payload, sources).model_dump()
+        cache.set(ck, resp)
+        return resp
+
+
+@app.post("/v1/deep-report", response_model=DeepReportResponse)
+async def deep_report(payload: DeepPayload, x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
+    require_server_key(x_api_key)
+
+    payload.ticker = normalize_text(payload.ticker, 20).upper()
+    payload.company = normalize_text(payload.company or "Unknown", 80)
+    payload.conviction = normalize_text(payload.conviction, 300)
+
+    ck = make_cache_key("deep", payload.model_dump())
+    if not payload.forceRefresh:
+        hit = cache.get(ck)
+        if hit:
+            hit["cached"] = True
+            return hit
+
+    query = build_search_query(payload.asset, payload.ticker, payload.company, payload.conviction)
+    hl, gl = locale_to_serper(payload.locale, payload.asset)
+    sources = await serper_search_sources(query, hl=hl, gl=gl, num=6)
+
+    try:
+        if GEMINI_API_KEY:
+            prompt = build_deep_prompt(payload, sources)
+            raw = await gemini_generate(GEMINI_MODEL_DEEP, prompt)
+            data = extract_first_json(raw)
+
+            counters_raw = data.get("counters") or []
+            questions_raw = data.get("questions") or []
+            summary = normalize_text(data.get("summary", ""), 300) or "반대 근거를 3~5개 축으로 잠급니다. 전제는 숫자와 출처로 고정되어야 합니다."
+
+            counters: List[CounterItem] = []
+            if isinstance(counters_raw, list):
+                for it in counters_raw[:5]:
                     if not isinstance(it, dict):
                         continue
-                    url = str(it.get("url") or "").strip()
-                    title = str(it.get("title") or "").strip()
-                    if url in allowed and title:
-                        filtered.append(it)
-                if not filtered:
-                    filtered = [s.model_dump() for s in sources[:3]]
-                out_sources = filtered[:3]
+                    counters.append(
+                        CounterItem(
+                            category=normalize_text(str(it.get("category", "리스크")), 20),
+                            headline=normalize_text(str(it.get("headline", "")), 120),
+                            evidence=normalize_text(str(it.get("evidence", "")), 600),
+                            numbers=(it.get("numbers") if isinstance(it.get("numbers"), list) else []),
+                            source_refs=(it.get("source_refs") if isinstance(it.get("source_refs"), list) else []),
+                        )
+                    )
 
-            resp = {**base, "blindspot": blind.model_dump(), "questions": questions, "sources": out_sources}
-            cache.set(key, resp)
-            return AnalyzeResponse(**resp)
-        except Exception:
-            # fallthrough to heuristic
-            pass
+            if not counters:
+                # AI가 이상하게 주면 fallback 카운터라도 넣기
+                counters = fallback_deep(payload, sources).counters
 
-    # fallback
-    blind = heuristic_blindspot(payload.conviction)
-    resp = {
-        **base,
-        "blindspot": blind.model_dump(),
-        "questions": heuristic_questions(),
-        "sources": [s.model_dump() for s in sources[:3]],
-    }
-    cache.set(key, resp)
-    return AnalyzeResponse(**resp)
+            questions = [normalize_text(q, 140) for q in (questions_raw[:3] if isinstance(questions_raw, list) else [])]
+            if len(questions) < 3:
+                questions = fallback_deep(payload, sources).questions
 
+            resp = DeepReportResponse(
+                asOf=now_iso(),
+                cached=False,
+                asset=payload.asset,
+                ticker=payload.ticker,
+                company=payload.company,
+                conviction=payload.conviction,
+                summary=summary,
+                counters=counters,
+                questions=questions,
+                sources=sources,
+            )
 
-@app.post("/deep-report", response_model=DeepReportResponse)
-def deep_report(payload: AnalyzePayload):
-    key = make_cache_key("deep-report", payload)
-    if not payload.forceRefresh:
-        hit = cache.get(key)
-        if hit is not None:
-            return DeepReportResponse(**hit, cached=True)
+            out = resp.model_dump()
+            cache.set(ck, out)
+            return out
 
-    # sources (deep-report는 2개 쿼리까지)
-    sources: List[SourceItem] = []
-    if ENABLE_SEARCH and SERPER_API_KEY:
-        queries = build_search_queries(payload.asset, payload.ticker, payload.company)
-        merged: Dict[str, SourceItem] = {}
-        for q in queries[:2]:
-            for s in serper_search(q, k=6):
-                merged[s.url] = s
-        sources = list(merged.values())[:10]
+        resp = fallback_deep(payload, sources).model_dump()
+        cache.set(ck, resp)
+        return resp
 
-    if not sources:
-        sources = source_fallback_candidates(payload.asset, payload.ticker, payload.company)
-
-    system = system_prompt_common()
-    user = user_prompt_deep(payload, sources)
-
-    js = call_gemini_json(system=system, user=user)
-
-    dt = now_kst()
-    base = {
-        "ok": True,
-        "cached": False,
-        "asOfISO": iso_kst(dt),
-        "asOfKorean": korean_datetime(dt),
-        "selection": {"asset": payload.asset, "ticker": payload.ticker, "company": payload.company or "Unknown"},
-        "conviction": _normalize_text(payload.conviction),
-        "disclaimer": disclaimer_text(),
-    }
-
-    if isinstance(js, dict):
-        try:
-            summary = str(js.get("summary") or "").strip()
-            if not summary:
-                summary = "논리의 취약점이 확인됐습니다. 핵심은 '검증 가능한 조건'과 '리스크 관리'입니다."
-
-            ce_raw = js.get("counterEvidence") or []
-            if not isinstance(ce_raw, list) or len(ce_raw) < 3:
-                raise ValueError("counterEvidence too small")
-
-            # safety: only allow URLs from provided sources
-            allowed_urls = {s.url for s in sources}
-
-            counter: List[Dict[str, Any]] = []
-            all_srcs: Dict[str, SourceItem] = {}
-
-            for item in ce_raw[:5]:
-                if not isinstance(item, dict):
-                    continue
-                sev = str(item.get("severity") or "medium").strip()
-                if sev not in ("low", "medium", "high"):
-                    sev = "medium"
-
-                title = str(item.get("title") or "").strip()
-                fact = str(item.get("fact") or "").strip()
-                why = str(item.get("whyItMatters") or "").strip()
-
-                srcs = []
-                for s in (item.get("sources") or [])[:2]:
-                    if not isinstance(s, dict):
-                        continue
-                    url = str(s.get("url") or "").strip()
-                    st = str(s.get("title") or "").strip()
-                    if url in allowed_urls and st:
-                        srcs.append({"title": st, "url": url, "publisher": s.get("publisher"), "snippet": s.get("snippet")})
-                        all_srcs[url] = SourceItem(title=st, url=url, publisher=s.get("publisher"), snippet=s.get("snippet"))
-
-                if title and fact and why:
-                    if not srcs:
-                        # if model forgot sources, attach one from candidates (still allowed)
-                        fallback_src = sources[0]
-                        srcs = [fallback_src.model_dump()]
-                        all_srcs[fallback_src.url] = fallback_src
-
-                    counter.append({
-                        "severity": sev,
-                        "title": title,
-                        "fact": fact,
-                        "whyItMatters": why,
-                        "sources": srcs,
-                    })
-
-            if len(counter) < 3:
-                raise ValueError("counterEvidence filtered too much")
-
-            questions = js.get("questions") or []
-            if not isinstance(questions, list) or len(questions) < 3:
-                questions = heuristic_questions()
-            else:
-                questions = [str(x) for x in questions[:3]]
-
-            # top sources for page footer
-            footer_sources = list(all_srcs.values())
-            if not footer_sources:
-                footer_sources = sources[:5]
-
-            resp = {
-                **base,
-                "summary": summary,
-                "counterEvidence": counter,
-                "questions": questions,
-                "sources": [s.model_dump() for s in footer_sources[:5]],
-            }
-            cache.set(key, resp)
-            return DeepReportResponse(**resp)
-
-        except Exception:
-            pass
-
-    # fallback deep-report (no Gemini or parse fail)
-    # produce non-empty content so your DeepReport screen isn't blank
-    b = heuristic_blindspot(payload.conviction)
-    ev = [
-        CounterEvidence(
-            severity="high" if b.severity == "high" else "medium",
-            title="전제 누락: 검증 조건이 없음",
-            fact=b.valueLine,
-            whyItMatters="조건이 없으면 틀렸을 때도 계속 들고 갑니다. 리스크는 '확률'이 아니라 '대응'에서 터집니다.",
-            sources=[s for s in sources[:1]],
-        ).model_dump(),
-        CounterEvidence(
-            severity="medium",
-            title="리스크 관리: 손절/무효화 기준 부재",
-            fact="손절 기준이 없으면 변동성이 '손실'로 고정됩니다.",
-            whyItMatters="시장에선 '맞았냐'보다 '틀렸을 때 얼마나 잃었냐'가 성과를 결정합니다.",
-            sources=[s for s in sources[1:2]] if len(sources) > 1 else [sources[0].model_dump()],
-        ).model_dump(),
-        CounterEvidence(
-            severity="medium",
-            title="확인 지표: 다음 분기 체크 포인트 미정",
-            fact="다음 분기에 확인할 숫자 1개가 없으면 학습이 안 됩니다.",
-            whyItMatters="확신을 업데이트하지 못하면 반복 손실로 갑니다. 체크 포인트가 곧 방어력입니다.",
-            sources=[s for s in sources[2:3]] if len(sources) > 2 else [sources[0].model_dump()],
-        ).model_dump(),
-    ]
-
-    resp = {
-        **base,
-        "summary": "심층 검증: 논리를 '조건/지표/리스크 관리'로 분해했습니다.",
-        "counterEvidence": ev,
-        "questions": heuristic_questions(),
-        "sources": [s.model_dump() for s in sources[:5]],
-    }
-    cache.set(key, resp)
-    return DeepReportResponse(**resp)
+    except Exception as e:
+        logger.warning(f"deep-report ai failed -> fallback: {e}")
+        resp = fallback_deep(payload, sources).model_dump()
+        cache.set(ck, resp)
+        return resp

@@ -8,8 +8,18 @@ services:
     envVars:
       - key: GEMINI_API_KEY
         sync: false
+
       - key: GEMINI_MODEL
         value: gemini-3-flash-preview
-      # 선택: 엔드포인트 보호
-      # - key: THE_SHORT_CLIENT_KEY
-      #   sync: false
+
+      - key: SEARCH_PROVIDER
+        value: serper
+
+      - key: SERPER_API_KEY
+        sync: false
+
+      - key: CACHE_TTL_SECONDS
+        value: "86400"
+
+      - key: CACHE_MAX_ITEMS
+        value: "2000"

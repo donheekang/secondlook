@@ -11,7 +11,7 @@
 # ✅ Won't crash on boot if env vars missing (safe fallback)
 # ============================================================
 
-from _future_ import annotations
+from __future__ import annotations
 
 import os
 import re

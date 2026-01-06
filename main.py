@@ -1,694 +1,973 @@
+# main.py
 import os
+import re
 import json
 import time
 import hashlib
-import logging
-import threading
-from datetime import datetime, timezone
+import asyncio
+from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timezone, timedelta
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional, Tuple, Literal
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+# Optional deps
+try:
+    import redis.asyncio as redis  # pip install redis
+except Exception:
+    redis = None
+
+try:
+    from bs4 import BeautifulSoup  # pip install beautifulsoup4
+except Exception:
+    BeautifulSoup = None
+
 # =========================================================
-# THE SHORT Backend (Render-friendly)
-# - FastAPI + httpx
-# - 24h in-memory TTL cache
-# - Serper search (optional) for sources
-# - Gemini generate (optional) for AI
-# - Never crash on startup because of missing deps/keys
+# Config
 # =========================================================
 
-# -----------------------
-# Logging
-# -----------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("the-short")
+APP_NAME = "THE SHORT API"
+PROMPT_VERSION_SHORT = "short.v1.0"
+PROMPT_VERSION_DEEP = "deep.v1.0"
+RETRIEVAL_VERSION = "r1"
 
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "86400"))  # 24h
+CACHE_MAX_ITEMS = int(os.getenv("CACHE_MAX_ITEMS", "2000"))
 
-# -----------------------
-# TTL Memory Cache (FIXED: accepts args)
-# -----------------------
-class TTLMemoryCache:
-    def _init_(self, ttl_seconds: int = 86400, max_items: int = 5000):
-        self.ttl_seconds = int(ttl_seconds)
-        self.max_items = int(max_items)
-        self._lock = threading.Lock()
-        self._data: "OrderedDict[str, Tuple[float, Any]]" = OrderedDict()
-
-    def get(self, key: str) -> Optional[Any]:
-        now = time.time()
-        with self._lock:
-            item = self._data.get(key)
-            if not item:
-                return None
-            exp, val = item
-            if exp < now:
-                self._data.pop(key, None)
-                return None
-            self._data.move_to_end(key)
-            return val
-
-    def set(self, key: str, value: Any) -> None:
-        exp = time.time() + self.ttl_seconds
-        with self._lock:
-            if key in self._data:
-                self._data.pop(key, None)
-            self._data[key] = (exp, value)
-            self._data.move_to_end(key)
-            while len(self._data) > self.max_items:
-                self._data.popitem(last=False)
-
-    def stats(self) -> Dict[str, Any]:
-        with self._lock:
-            return {
-                "ttl_seconds": self.ttl_seconds,
-                "max_items": self.max_items,
-                "items": len(self._data),
-            }
-
-
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "86400"))  # 24h default
-CACHE_MAX_ITEMS = int(os.getenv("CACHE_MAX_ITEMS", "5000"))
-cache = TTLMemoryCache(ttl_seconds=CACHE_TTL_SECONDS, max_items=CACHE_MAX_ITEMS)
-
-
-# -----------------------
-# Env / Config
-# -----------------------
-# iOS 앱 ↔️ 서버 간 간단 인증키 (선택)
-SERVER_API_KEY = os.getenv("SERVER_API_KEY", "").strip()
-# Serper (구글 검색 API) - 출처 리스트 만들 때 사용 (선택)
+SEARCH_PROVIDER = os.getenv("SEARCH_PROVIDER", "serper").strip().lower()  # serper|brave|none
 SERPER_API_KEY = os.getenv("SERPER_API_KEY", "").strip()
+BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "").strip()
 
-# Gemini API key (필수로 쓰고 싶으면 넣어야 함)
-# 구글 키 이름이 GOOGLE_API_KEY 인 경우도 있어서 둘 다 지원
-GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")).strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+# ✅ 모델명은 환경변수로 교체 가능 (네가 쓰는 gemini-3.0-flash를 여기 넣으면 됨)
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
+GEMINI_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.2"))
+GEMINI_MAX_TOKENS_SHORT = int(os.getenv("GEMINI_MAX_TOKENS_SHORT", "1600"))
+GEMINI_MAX_TOKENS_DEEP = int(os.getenv("GEMINI_MAX_TOKENS_DEEP", "3200"))
 
-# 모델명은 네가 Render env로 바꿀 수 있게 열어둠
-GEMINI_MODEL_ANALYZE = os.getenv("GEMINI_MODEL_ANALYZE", os.getenv("GEMINI_MODEL", "gemini-3.0-flash")).strip()
-GEMINI_MODEL_DEEP = os.getenv("GEMINI_MODEL_DEEP", os.getenv("GEMINI_MODEL", "gemini-3.0-flash")).strip()
+REDIS_URL = os.getenv("REDIS_URL", "").strip()  # optional
 
-# Generative Language API (기본은 v1beta)
-GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta").strip()
+FETCH_CONCURRENCY = int(os.getenv("FETCH_CONCURRENCY", "6"))
+MAX_SOURCES = int(os.getenv("MAX_SOURCES", "12"))
+MAX_EXCERPTS_PER_SOURCE = int(os.getenv("MAX_EXCERPTS_PER_SOURCE", "4"))
+MAX_TOTAL_EXCERPTS = int(os.getenv("MAX_TOTAL_EXCERPTS", "48"))
+MAX_FETCH_BYTES = int(os.getenv("MAX_FETCH_BYTES", str(800_000)))  # ~0.8MB
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "12"))
 
-SERPER_ENDPOINT = os.getenv("SERPER_ENDPOINT", "https://google.serper.dev/search").strip()
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
 
-# CORS (웹 디버깅용; iOS 앱은 보통 필요 없지만 열어둠)
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").strip()
+USER_AGENT = os.getenv(
+    "USER_AGENT",
+    "Mozilla/5.0 (compatible; TheShortBot/1.0; +https://secondlook.onrender.com)"
+)
 
+# =========================================================
+# Prompts (System + Templates)
+# =========================================================
 
-# -----------------------
-# FastAPI App
-# -----------------------
-app = FastAPI(title="The Short API", version="1.0.0")
+SYSTEM_PROMPT = """You are "THE SHORT" risk reviewer.
+
+Tone:
+•⁠  ⁠Cold, concise, decisive.
+•⁠  ⁠Attack the logic, not the person.
+•⁠  ⁠No profanity, insults, slurs, harassment.
+•⁠  ⁠No memes, no roleplay, no emojis.
+
+Safety:
+•⁠  ⁠NOT investment advice. Do NOT tell the user to buy/sell/short/hold.
+•⁠  ⁠Do NOT claim certainty. Use evidence and verification.
+
+Truthfulness (critical):
+•⁠  ⁠Use ONLY facts found in CONTEXT_EXCERPTS_JSON.
+•⁠  ⁠Do NOT invent numbers, dates, events, or sources.
+•⁠  ⁠If a needed number is missing, explicitly state it is missing and use next_metric.
+
+Output:
+•⁠  ⁠Return ONLY valid JSON (no markdown, no extra text).
+•⁠  ⁠Follow the provided JSON schema exactly.
+•⁠  ⁠Keep stable phrasing and ordering to improve caching consistency.
+"""
+
+SHORT_USER_PROMPT_TEMPLATE = """TASK:
+Generate a "Short Report" in Korean as valid JSON.
+Return:
+•⁠  ⁠blindspot (single strongest missing assumption)
+•⁠  ⁠questions (exactly 3)
+•⁠  ⁠sources (0~6, only from CONTEXT_SOURCES_JSON)
+•⁠  ⁠as_of, prompt_version, asset, ticker, company, conviction_original
+
+Hard rules:
+•⁠  ⁠Use ONLY facts from CONTEXT_EXCERPTS_JSON. No fabrication.
+•⁠  ⁠If evidence is missing, say it is missing and ask for verification via next_metric.
+•⁠  ⁠Questions must reference or quote the user's conviction_original.
+
+INPUT:
+prompt_version = "{prompt_version}"
+asset = "{asset}"            # US|KR|COIN
+ticker = "{ticker}"
+company = "{company}"
+conviction_original = "{conviction}"
+now_iso = "{now_iso}"
+
+CONTEXT_SOURCES_JSON:
+{context_sources_json}
+
+CONTEXT_EXCERPTS_JSON:
+{context_excerpts_json}
+
+OUTPUT JSON schema:
+{{
+  "prompt_version": "{prompt_version}",
+  "as_of": "ISO8601 string",
+  "asset": "US|KR|COIN",
+  "ticker": "string",
+  "company": "string",
+  "conviction_original": "string",
+  "blindspot": {{
+    "title": "string",
+    "value_line": "string",
+    "detail": "string",
+    "severity": "low|medium|high",
+    "confidence": 0.0,
+    "next_metric": "string",
+    "sources": [
+      {{ "title": "string", "url": "string" }}
+    ]
+  }},
+  "questions": ["string", "string", "string"],
+  "sources": [
+    {{ "title": "string", "url": "string" }}
+  ]
+}}
+Return ONLY JSON.
+"""
+
+DEEP_USER_PROMPT_TEMPLATE = """TASK:
+Generate a "Deep Report" in Korean as valid JSON.
+You must select 3 to 5 evidence slots among A-E.
+If asset == "COIN", slot E is mandatory.
+
+Slot definitions:
+A: 수요/성장 (Revenue/Demand)
+B: 마진/현금흐름 (Profitability/Cash Flow)
+C: 경쟁/가격결정력 (Competition/Pricing Power)
+D: 규제/법/집행/운영 리스크 (Regulatory/Legal/Execution)
+E: 밸류/수급/공급/오버행 (Valuation/Supply/Overhang) — mandatory for COIN
+
+Hard rules:
+1) Every evidence must directly challenge the user's conviction sentence.
+2) fact_line must be ONE line. If you cannot support it from CONTEXT_EXCERPTS_JSON, write "근거 수치/팩트가 확인되지 않았습니다." and set next_metric.
+3) sources in each evidence must be selected ONLY from CONTEXT_SOURCES_JSON, and must match the evidence content.
+4) Create exactly 3 counter_questions:
+   - Each question must reference or quote a phrase from conviction_original.
+   - Q1 forces a numeric threshold (반증 조건).
+   - Q2 forces a time horizon / next check date (검증 시점).
+   - Q3 forces an action plan under risk (대응 계획).
+
+Ordering (stable):
+•⁠  ⁠For US/KR: evidences order A -> B -> C -> D -> E (include only selected ones)
+•⁠  ⁠For COIN: evidences order E -> A -> B -> D -> C (include only selected ones)
+•⁠  ⁠counter_questions order: 조건 -> 시점 -> 대응
+
+INPUT:
+prompt_version = "{prompt_version}"
+asset = "{asset}"            # US|KR|COIN
+ticker = "{ticker}"
+company = "{company}"
+conviction_original = "{conviction}"
+now_iso = "{now_iso}"
+
+CONTEXT_SOURCES_JSON:
+{context_sources_json}
+
+CONTEXT_EXCERPTS_JSON:
+{context_excerpts_json}
+
+OUTPUT JSON schema:
+{{
+  "prompt_version": "{prompt_version}",
+  "as_of": "ISO8601 string",
+  "asset": "US|KR|COIN",
+  "ticker": "string",
+  "company": "string",
+  "conviction_original": "string",
+  "conviction_parsed": {{
+    "claim": "string",
+    "assumptions": ["string"],
+    "time_horizon": "단기|중기|장기|불명"
+  }},
+  "evidences": [
+    {{
+      "slot_id": "A|B|C|D|E",
+      "slot_name": "string",
+      "title": "string",
+      "fact_line": "string",
+      "detail": "string",
+      "severity": "low|medium|high",
+      "confidence": 0.0,
+      "next_metric": "string",
+      "sources": [
+        {{ "title": "string", "url": "string" }}
+      ]
+    }}
+  ],
+  "counter_questions": ["string", "string", "string"],
+  "sources_top": [
+    {{ "title": "string", "url": "string" }}
+  ]
+}}
+Return ONLY JSON.
+"""
+
+# =========================================================
+# FastAPI app
+# =========================================================
+
+app = FastAPI(title=APP_NAME)
+
+if ALLOWED_ORIGINS.strip() == "*":
+    origins = ["*"]
+else:
+    origins = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[""] if ALLOWED_ORIGINS == "" else [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-_http: Optional[httpx.AsyncClient] = None
+# =========================================================
+# Models
+# =========================================================
 
+class AnalyzeRequest(BaseModel):
+    ticker: str = Field(..., min_length=1, max_length=20)
+    company: str = Field(default="Unknown", max_length=120)
+    conviction: str = Field(..., min_length=1, max_length=400)
+    locale: str = Field(default="ko-KR")
+    asset: Optional[str] = Field(default=None, description="US|KR|COIN")
+    force_refresh: bool = Field(default=False)
+
+class DeepReportRequest(AnalyzeRequest):
+    pass
+
+# =========================================================
+# Cache (Redis preferred, memory fallback)
+# =========================================================
+
+class TTLMemoryCache:
+    """
+    ✅ Fix for your Render crash:
+    - This class ACCEPTS ttl_seconds/max_items so TTLMemoryCache(ttl_seconds=..., max_items=...) works.
+    """
+    def _init_(self, ttl_seconds: int = 86400, max_items: int = 2000):
+        self.ttl_seconds = int(ttl_seconds)
+        self.max_items = int(max_items)
+        self._mem: "OrderedDict[str, Tuple[float, str]]" = OrderedDict()
+        self._lock = asyncio.Lock()
+
+    async def get(self, key: str) -> Optional[str]:
+        async with self._lock:
+            item = self._mem.get(key)
+            if not item:
+                return None
+            exp, val = item
+            if time.time() > exp:
+                self._mem.pop(key, None)
+                return None
+            # LRU touch
+            self._mem.move_to_end(key, last=True)
+            return val
+
+    async def set(self, key: str, val: str, ttl: Optional[int] = None) -> None:
+        ttl = int(ttl if ttl is not None else self.ttl_seconds)
+        async with self._lock:
+            exp = time.time() + ttl
+            if key in self._mem:
+                self._mem.pop(key, None)
+            self._mem[key] = (exp, val)
+            self._mem.move_to_end(key, last=True)
+
+            # LRU trim
+            while len(self._mem) > self.max_items:
+                self._mem.popitem(last=False)
+
+class Cache:
+    def _init_(self):
+        self.redis = None
+        self.mem = TTLMemoryCache(ttl_seconds=CACHE_TTL_SECONDS, max_items=CACHE_MAX_ITEMS)
+
+    async def init(self):
+        if REDIS_URL and redis is not None:
+            self.redis = redis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
+
+    async def get(self, key: str) -> Optional[str]:
+        if self.redis is not None:
+            try:
+                return await self.redis.get(key)
+            except Exception:
+                return await self.mem.get(key)
+        return await self.mem.get(key)
+
+    async def set(self, key: str, val: str, ttl: int) -> None:
+        if self.redis is not None:
+            try:
+                await self.redis.setex(key, ttl, val)
+                return
+            except Exception:
+                pass
+        await self.mem.set(key, val, ttl)
+
+cache = Cache()
 
 @app.on_event("startup")
-async def _startup() -> None:
-    global _http
-    _http = httpx.AsyncClient(
-        timeout=httpx.Timeout(30.0, connect=10.0),
-        headers={"User-Agent": "the-short/1.0"},
-    )
-    logger.info("startup ok")
+async def _startup():
+    await cache.init()
 
+# =========================================================
+# Utilities
+# =========================================================
 
-@app.on_event("shutdown")
-async def _shutdown() -> None:
-    global _http
-    if _http:
-        await _http.aclose()
-    _http = None
-    logger.info("shutdown ok")
+def now_iso_kst() -> str:
+    kst = timezone(timedelta(hours=9))
+    return datetime.now(kst).isoformat()
 
+def normalize_conviction(text: str) -> str:
+    t = text.strip()
+    t = re.sub(r"\s+", " ", t)
+    return t
 
-# -----------------------
-# Models
-# -----------------------
-AssetType = Literal["US", "KR", "COIN"]
-SeverityType = Literal["LOW", "MED", "HIGH"]
+def infer_asset(asset: Optional[str], ticker: str) -> str:
+    if asset:
+        a = asset.strip().upper()
+        if a in ("US", "KR", "COIN"):
+            return a
 
+    t = ticker.strip()
+    if re.fullmatch(r"\d{6}", t):
+        return "KR"
 
-class AnalyzePayload(BaseModel):
-    asset: AssetType = Field(..., description="US | KR | COIN")
-    ticker: str = Field(..., min_length=1, max_length=20)
-    company: Optional[str] = Field(None, max_length=80)
-    conviction: str = Field(..., min_length=3, max_length=300)
-    locale: str = Field("ko-KR")
-    forceRefresh: bool = Field(False)
+    up = t.upper()
+    if up in {"BTC", "ETH", "SOL", "XRP", "BNB", "WLD", "ADA", "DOGE", "AVAX", "LINK", "LTC"}:
+        return "COIN"
 
+    return "US"
 
-class SourceItem(BaseModel):
-    title: str
-    url: str
-    domain: str
+def sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
+def cache_key(endpoint: str, asset: str, ticker: str, conviction_norm: str, prompt_version: str) -> str:
+    raw = f"{endpoint}|{asset}|{ticker}|{conviction_norm}|{prompt_version}|{GEMINI_MODEL}|{RETRIEVAL_VERSION}"
+    return "th:" + sha256_hex(raw)
 
-class Blindspot(BaseModel):
-    title: str
-    valueLine: str
-    detail: str
-    severity: SeverityType
+def safe_json_dumps(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), sort_keys=False)
 
+def extract_domain(url: str) -> str:
+    m = re.match(r"^https?://([^/]+)", url)
+    return (m.group(1) if m else "").lower()
 
-class AnalyzeResponse(BaseModel):
-    asOf: str
-    cached: bool
-    asset: AssetType
-    ticker: str
-    company: Optional[str]
-    conviction: str
-    blindspot: Blindspot
-    questions: List[str]
-    sources: List[SourceItem]
+def is_probably_pdf(url: str, content_type: Optional[str]) -> bool:
+    if url.lower().endswith(".pdf"):
+        return True
+    if content_type and "pdf" in content_type.lower():
+        return True
+    return False
 
+def split_sentences(text: str) -> List[str]:
+    t = text.replace("\r", "\n")
+    t = re.sub(r"[ \t]+", " ", t)
+    chunks = re.split(r"\n{1,}", t)
 
-class DeepPayload(BaseModel):
-    asset: AssetType
-    ticker: str
-    company: Optional[str] = None
-    conviction: str
-    locale: str = "ko-KR"
-    forceRefresh: bool = False
+    out: List[str] = []
+    for ch in chunks:
+        ch = ch.strip()
+        if not ch:
+            continue
+        parts = re.split(r"(?<=[\.\?\!])\s+|(?<=다\.)\s+|(?<=다\!)\s+|(?<=다\?)\s+", ch)
+        for p in parts:
+            s = p.strip()
+            if 30 <= len(s) <= 320:
+                out.append(s)
 
+    seen = set()
+    uniq: List[str] = []
+    for s in out:
+        key = s[:60]
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(s)
+    return uniq
 
-class CounterItem(BaseModel):
-    category: str
-    headline: str
-    evidence: str
-    numbers: List[Dict[str, str]] = []
-    source_refs: List[int] = []  # sources index 참조
+def slot_to_tag(slot: str) -> str:
+    return {"A": "demand", "B": "margin", "C": "competition", "D": "regulation", "E": "valuation"}.get(slot, "other")
 
+def score_sentence(sentence: str, asset: str) -> Tuple[float, List[str], str]:
+    s = sentence
+    s_low = s.lower()
 
-class DeepReportResponse(BaseModel):
-    asOf: str
-    cached: bool
-    asset: AssetType
-    ticker: str
-    company: Optional[str]
-    conviction: str
-    summary: str
-    counters: List[CounterItem]
-    questions: List[str]
-    sources: List[SourceItem]
+    score = 0.0
+    tags: List[str] = []
 
+    if re.search(r"\d", s):
+        score += 4.0
+    if re.search(r"(%|bps|\$|usd|krw|원|달러|억원|조원)", s_low):
+        score += 2.0
 
-# -----------------------
-# Helpers
-# -----------------------
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    if re.search(r"(may|might|could|possible|추정|예상|가능성|전망)", s_low):
+        score -= 1.0
 
+    KW_A = ["매출", "성장", "수요", "출하", "주문", "사용자", "dau", "mau", "revenue", "growth", "deliveries", "shipments"]
+    KW_B = ["마진", "영업이익", "순이익", "fcf", "현금흐름", "capex", "gross margin", "operating margin", "free cash flow", "cost"]
+    KW_C = ["경쟁", "점유율", "가격", "단가", "asp", "pricing", "competition", "market share", "rival"]
+    KW_D = ["규제", "제재", "조사", "소송", "벌금", "당국", "sec", "fss", "금감원", "lawsuit", "fine", "regulation"]
+    KW_E_stock = ["밸류", "per", "p/e", "ev/ebitda", "희석", "증자", "오버행", "buyback", "dilution", "valuation", "multiple"]
+    KW_E_coin = ["fdv", "유통", "총공급", "max supply", "unlock", "vesting", "인플레", "supply", "emission", "락업", "언락"]
 
-def normalize_text(s: str, max_len: int = 400) -> str:
-    s = (s or "").strip()
-    s = " ".join(s.split())
-    return s[:max_len]
+    slot_scores: Dict[str, float] = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0, "E": 0.0}
 
+    def bump(slot: str, kws: List[str], w: float):
+        for kw in kws:
+            if kw.lower() in s_low:
+                slot_scores[slot] += w
 
-def safe_domain(url: str) -> str:
-    try:
-        u = httpx.URL(url)
-        return (u.host or "").lower()
-    except Exception:
-        return ""
+    bump("A", KW_A, 1.0)
+    bump("B", KW_B, 1.0)
+    bump("C", KW_C, 1.0)
+    bump("D", KW_D, 1.0)
+    bump("E", KW_E_coin if asset == "COIN" else KW_E_stock, 1.2 if asset == "COIN" else 1.0)
 
+    best_slot, best_val = max(slot_scores.items(), key=lambda x: x[1])
+    score += best_val * 1.2
 
-def make_cache_key(prefix: str, payload_dict: Dict[str, Any]) -> str:
-    # forceRefresh는 캐시 키에서 제외 (동일 입력이면 같은 키)
-    d = {k: v for k, v in payload_dict.items() if k != "forceRefresh"}
-    raw = json.dumps(d, ensure_ascii=False, sort_keys=True)
-    h = hashlib.sha256((prefix + "|" + raw).encode("utf-8")).hexdigest()
-    return h
+    sorted_slots = sorted(slot_scores.items(), key=lambda x: x[1], reverse=True)
+    for slot, val in sorted_slots[:2]:
+        if val > 0:
+            tags.append(slot_to_tag(slot))
 
+    confidence = "high" if re.search(r"\d", s) else "medium"
+    return score, tags[:2], confidence
 
-def extract_first_json(text: str) -> Dict[str, Any]:
-    # Gemini가 ⁠ json  ⁠으로 감싸도 그냥 첫 { ... }만 뽑아 파싱
-    if not text:
-        raise ValueError("empty")
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end < start:
-        raise ValueError("no json object")
-    snippet = text[start : end + 1]
-    return json.loads(snippet)
+def tier_for_domain(asset: str, domain: str) -> str:
+    d = domain.lower()
+    primary_us = {"sec.gov"}
+    primary_kr = {"dart.fss.or.kr", "kind.krx.co.kr", "krx.co.kr"}
+    primary_coin = {"coinmarketcap.com", "coingecko.com"}
 
+    reputable = {
+        "reuters.com", "ft.com", "wsj.com", "bloomberg.com", "finance.yahoo.com",
+        "investing.com", "marketwatch.com", "seekingalpha.com"
+    }
 
-def require_server_key(x_api_key: Optional[str]) -> None:
-    # SERVER_API_KEY를 설정한 경우에만 체크 (설정 안 하면 오픈)
-    if not SERVER_API_KEY:
-        return
-    if not x_api_key or x_api_key.strip() != SERVER_API_KEY:
-        raise HTTPException(status_code=401, detail="unauthorized")
+    if asset == "US" and d in primary_us:
+        return "primary"
+    if asset == "KR" and d in primary_kr:
+        return "primary"
+    if asset == "COIN" and d in primary_coin:
+        return "reputable"
+    if d in reputable:
+        return "reputable"
+    return "other"
 
+# =========================================================
+# Search providers
+# =========================================================
 
-# -----------------------
-# Serper Search (optional)
-# -----------------------
-def build_search_query(asset: AssetType, ticker: str, company: Optional[str], conviction: str) -> str:
-    base = ticker
-    if company and company.lower() != "unknown":
-        base += f" {company}"
-
-    conviction = normalize_text(conviction, 120)
-
-    if asset == "COIN":
-        # 코인은 이 키워드들이 출처 뽑기에 잘 먹힘
-        return f"{base} token unlock schedule circulating supply FDV {conviction}"
-    if asset == "KR":
-        return f"{base} 실적 리스크 경쟁 규제 밸류에이션 {conviction}"
-    # US
-    return f"{base} earnings risk competition regulation valuation {conviction}"
-
-
-def locale_to_serper(locale: str, asset: AssetType) -> Tuple[str, str]:
-    # hl: language, gl: country
-    # 한국 사용자 기준으로 hl=ko 유지하되, US는 gl=us로 소스 폭을 넓힘
-    hl = "ko" if locale.lower().startswith("ko") else "en"
-    if asset == "US":
-        return hl, "us"
-    if asset == "KR":
-        return hl, "kr"
-    return hl, "us"
-
-
-async def serper_search_sources(query: str, hl: str, gl: str, num: int = 5) -> List[SourceItem]:
+async def search_serper(query: str, num: int = 6) -> List[Dict[str, Any]]:
     if not SERPER_API_KEY:
         return []
-    if not _http:
-        return []
-
-    try:
-        headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
-        body = {"q": query, "hl": hl, "gl": gl, "num": num}
-        r = await _http.post(SERPER_ENDPOINT, headers=headers, json=body)
+    url = "https://google.serper.dev/search"
+    headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json", "User-Agent": USER_AGENT}
+    payload = {"q": query, "num": num}
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        r = await client.post(url, headers=headers, json=payload)
         r.raise_for_status()
         data = r.json()
-        organic = data.get("organic", []) or []
-        out: List[SourceItem] = []
-        for it in organic[:num]:
-            url = it.get("link") or ""
-            title = it.get("title") or ""
-            if not url or not title:
-                continue
-            out.append(SourceItem(title=title[:140], url=url, domain=safe_domain(url)))
-        return out
-    except Exception as e:
-        logger.warning(f"serper failed: {e}")
+
+    out: List[Dict[str, Any]] = []
+    for item in data.get("organic", []) or []:
+        out.append({"title": item.get("title", ""), "url": item.get("link", ""), "snippet": item.get("snippet", "")})
+    return [x for x in out if x.get("url")]
+
+async def search_brave(query: str, count: int = 6) -> List[Dict[str, Any]]:
+    if not BRAVE_API_KEY:
         return []
+    url = "https://api.search.brave.com/res/v1/web/search"
+    headers = {"X-Subscription-Token": BRAVE_API_KEY, "Accept": "application/json", "User-Agent": USER_AGENT}
+    params = {"q": query, "count": str(count)}
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        r = await client.get(url, headers=headers, params=params)
+        r.raise_for_status()
+        data = r.json()
 
+    out: List[Dict[str, Any]] = []
+    web = (data.get("web") or {}).get("results") or []
+    for item in web:
+        out.append({"title": item.get("title", ""), "url": item.get("url", ""), "snippet": item.get("description", "")})
+    return [x for x in out if x.get("url")]
 
-# -----------------------
-# Gemini (optional)
-# -----------------------
-def system_prompt_ko() -> str:
-    # 말투: 차갑고 단정. 욕설/비하 금지.
-    return (
-        "너는 '더 쇼트(The Short)'의 데이터 검증관이다.\n"
-        "- 목표: 사용자의 투자 논리에서 가장 취약한 전제 1개를 '팩트 중심'으로 찌른다.\n"
-        "- 톤: 차갑고 단정, 짧고 강하다. 하지만 욕설/비하/혐오 표현은 금지.\n"
-        "- 출처가 제공되면, 그 범위 내에서만 추론하고 과장은 하지 마라.\n"
-        "- 결과는 반드시 JSON만 출력한다(마크다운/설명 금지).\n"
-    )
+async def web_search(queries: List[str], per_query: int = 6) -> List[Dict[str, Any]]:
+    if SEARCH_PROVIDER in ("none", "off"):
+        return []
+    results: List[Dict[str, Any]] = []
+    for q in queries:
+        q = q.strip()
+        if not q:
+            continue
+        if SEARCH_PROVIDER == "brave":
+            hits = await search_brave(q, count=per_query)
+        else:
+            hits = await search_serper(q, num=per_query)
+        results.extend(hits)
+    return results
 
+def build_queries(asset: str, ticker: str, company: str) -> List[str]:
+    base = f"{ticker} {company}".strip()
+    if asset == "US":
+        return [
+            f"{base} 10-Q revenue operating margin free cash flow",
+            f"{base} earnings release guidance margin",
+            f"{base} competition pricing pressure market share",
+            f"{base} lawsuit regulatory risk SEC",
+            f"{base} valuation PE multiple",
+        ]
+    if asset == "KR":
+        return [
+            f"{ticker} {company} 분기보고서 매출 영업이익 DART",
+            f"{company} 사업보고서 DART",
+            f"{company} 공시 KIND KRX",
+            f"{company} 경쟁사 점유율 가격",
+            f"{company} 소송 규제 리스크",
+        ]
+    up = ticker.upper()
+    return [
+        f"{up} tokenomics FDV circulating supply",
+        f"{up} unlock schedule vesting",
+        f"{up} token distribution whitepaper",
+        f"{up} regulatory investigation fine",
+        f"{up} exchange delisting notice",
+    ]
 
-def build_analyze_prompt(payload: AnalyzePayload, sources: List[SourceItem]) -> str:
-    src_lines = []
-    for i, s in enumerate(sources):
-        src_lines.append(f"[{i}] {s.title} ({s.domain}) {s.url}")
+def dedup_and_rank_sources(asset: str, raw_hits: List[Dict[str, Any]], limit: int = MAX_SOURCES) -> List[Dict[str, Any]]:
+    seen_url = set()
+    by_domain_count: Dict[str, int] = {}
 
-    src_block = "\n".join(src_lines) if src_lines else "(no sources provided)"
+    def score_hit(h: Dict[str, Any]) -> float:
+        url = h.get("url", "")
+        dom = extract_domain(url)
+        tier = tier_for_domain(asset, dom)
+        s = 0.0
+        s += 5.0 if tier == "primary" else 2.5 if tier == "reputable" else 0.5
+        snippet = (h.get("snippet") or "").lower()
+        if re.search(r"\d", snippet):
+            s += 1.0
+        return s
 
-    return (
-        f"{system_prompt_ko()}\n"
-        "다음 입력을 분석하라.\n"
-        f"- asset: {payload.asset}\n"
-        f"- ticker: {payload.ticker}\n"
-        f"- company: {payload.company or 'Unknown'}\n"
-        f"- conviction: {payload.conviction}\n\n"
-        "가능하면 아래 '출처 목록'에서 근거 힌트를 사용하라.\n"
-        f"출처 목록:\n{src_block}\n\n"
-        "아래 스키마로 JSON만 출력:\n"
-        "{\n"
-        '  "blindspot": {\n'
-        '    "title": "짧은 제목",\n'
-        '    "valueLine": "강한 한 줄 팩트/경고",\n'
-        '    "detail": "2~4문장 설명(과장 금지)",\n'
-        '    "severity": "LOW|MED|HIGH"\n'
-        "  },\n"
-        '  "questions": ["질문1", "질문2", "질문3"]\n'
-        "}\n"
-    )
+    ranked = sorted(raw_hits, key=score_hit, reverse=True)
 
+    out: List[Dict[str, Any]] = []
+    for h in ranked:
+        url = (h.get("url") or "").strip()
+        if not url.startswith("http"):
+            continue
+        if url in seen_url:
+            continue
+        dom = extract_domain(url)
+        if not dom:
+            continue
+        if by_domain_count.get(dom, 0) >= 2:
+            continue
 
-def build_deep_prompt(payload: DeepPayload, sources: List[SourceItem]) -> str:
-    src_lines = []
-    for i, s in enumerate(sources):
-        src_lines.append(f"[{i}] {s.title} ({s.domain}) {s.url}")
-    src_block = "\n".join(src_lines) if src_lines else "(no sources provided)"
+        seen_url.add(url)
+        by_domain_count[dom] = by_domain_count.get(dom, 0) + 1
 
-    return (
-        f"{system_prompt_ko()}\n"
-        "다음 입력을 기반으로 '심층 반격 리포트'를 작성하라.\n"
-        "- 요구사항:\n"
-        "  1) 반대 근거 3~5개 (수요/마진/경쟁/규제/밸류에이션 중 최소 3범주)\n"
-        "  2) 각 근거는 headline(짧게) + evidence(2~4문장) + numbers(있으면) + source_refs(출처 index)\n"
-        "  3) 마지막에 날카로운 질문 3개\n"
-        "  4) 욕설/비하/혐오 금지. 단정하고 냉정.\n\n"
-        f"- asset: {payload.asset}\n"
-        f"- ticker: {payload.ticker}\n"
-        f"- company: {payload.company or 'Unknown'}\n"
-        f"- conviction: {payload.conviction}\n\n"
-        f"출처 목록:\n{src_block}\n\n"
-        "아래 스키마로 JSON만 출력:\n"
-        "{\n"
-        '  "summary": "2~3문장 요약",\n'
-        '  "counters": [\n'
-        "    {\n"
-        '      "category": "수요|마진|경쟁|규제|밸류에이션",\n'
-        '      "headline": "짧고 강한 한 줄",\n'
-        '      "evidence": "2~4문장",\n'
-        '      "numbers": [{"label":"", "value":""}],\n'
-        '      "source_refs": [0,1]\n'
-        "    }\n"
-        "  ],\n"
-        '  "questions": ["질문1", "질문2", "질문3"]\n'
-        "}\n"
-    )
+        out.append({
+            "title": (h.get("title") or "").strip()[:180],
+            "url": url,
+            "publisher": dom,
+            "published_at": "",
+            "tier": tier_for_domain(asset, dom)
+        })
+        if len(out) >= limit:
+            break
+    return out
 
+# =========================================================
+# Fetch & Excerpt extraction
+# =========================================================
 
-async def gemini_generate(model: str, prompt: str) -> str:
+async def fetch_text(url: str, sem: asyncio.Semaphore) -> Tuple[str, Optional[str]]:
+    async with sem:
+        async with httpx.AsyncClient(
+            timeout=HTTP_TIMEOUT,
+            headers={"User-Agent": USER_AGENT, "Accept": "/"},
+            follow_redirects=True,
+        ) as client:
+            r = await client.get(url)
+            ctype = r.headers.get("content-type")
+            data = r.content[:MAX_FETCH_BYTES]
+
+            if is_probably_pdf(url, ctype):
+                return "", ctype
+
+            if BeautifulSoup is None:
+                return data.decode(errors="ignore"), ctype
+
+            html = data.decode(errors="ignore")
+            soup = BeautifulSoup(html, "html.parser")
+            for tag in soup(["script", "style", "noscript", "svg", "header", "footer", "nav", "aside", "form"]):
+                try:
+                    tag.decompose()
+                except Exception:
+                    pass
+            text = soup.get_text(separator="\n")
+            lines = [ln.strip() for ln in text.splitlines()]
+            lines = [ln for ln in lines if ln and len(ln) < 500]
+            return "\n".join(lines), ctype
+
+async def build_excerpts(asset: str, sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    sem = asyncio.Semaphore(FETCH_CONCURRENCY)
+
+    # add stable ids
+    for i, s in enumerate(sources, start=1):
+        s["id"] = f"s{i}"
+
+    async def process_source(src: Dict[str, Any]) -> List[Dict[str, Any]]:
+        url = src["url"]
+        try:
+            text, ctype = await fetch_text(url, sem)
+        except Exception:
+            return []
+
+        if not text or is_probably_pdf(url, ctype):
+            return []
+
+        sents = split_sentences(text)
+        scored: List[Tuple[float, str, List[str], str]] = []
+        for sent in sents:
+            sc, tags, conf = score_sentence(sent, asset)
+            scored.append((sc, sent, tags, conf))
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        out: List[Dict[str, Any]] = []
+        for sc, sent, tags, conf in scored[:MAX_EXCERPTS_PER_SOURCE]:
+            out.append({
+                "source_id": src["id"],
+                "excerpt": sent,
+                "tag": tags,
+                "confidence": conf
+            })
+        return out
+
+    chunks = await asyncio.gather(*(process_source(s) for s in sources), return_exceptions=True)
+    excerpts: List[Dict[str, Any]] = []
+    for ch in chunks:
+        if isinstance(ch, Exception):
+            continue
+        excerpts.extend(ch)
+
+    # stable-ish ordering: prefer digits first, then source_id
+    def excerpt_rank(e: Dict[str, Any]) -> Tuple[int, str]:
+        has_digit = 1 if re.search(r"\d", e.get("excerpt", "")) else 0
+        return (-has_digit, e.get("source_id", ""))
+
+    excerpts.sort(key=excerpt_rank)
+    return excerpts[:MAX_TOTAL_EXCERPTS]
+
+# =========================================================
+# Gemini call (REST)
+# =========================================================
+
+class GeminiError(Exception):
+    pass
+
+def parse_json_strict(text: str) -> Dict[str, Any]:
+    try:
+        return json.loads(text)
+    except Exception:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return json.loads(text[start:end+1])
+    raise GeminiError("Model did not return valid JSON")
+
+async def gemini_generate_json(user_prompt: str, max_tokens: int) -> Dict[str, Any]:
     if not GEMINI_API_KEY:
-        raise RuntimeError("missing GEMINI_API_KEY (or GOOGLE_API_KEY)")
-    if not _http:
-        raise RuntimeError("http client not ready")
+        raise GeminiError("GEMINI_API_KEY is missing")
 
-    url = f"{GEMINI_BASE_URL}/models/{model}:generateContent"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
     params = {"key": GEMINI_API_KEY}
 
-    body = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": prompt}],
-            }
-        ],
+    payload: Dict[str, Any] = {
+        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
         "generationConfig": {
-            "temperature": 0.4,
-            "maxOutputTokens": 900,
+            "temperature": GEMINI_TEMPERATURE,
+            "maxOutputTokens": max_tokens,
+            "candidateCount": 1,
         },
     }
 
-    r = await _http.post(url, params=params, json=body)
-    if r.status_code >= 400:
-        raise RuntimeError(f"gemini http {r.status_code}: {r.text[:300]}")
-    data = r.json()
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT * 2, headers={"User-Agent": USER_AGENT}) as client:
+        r = await client.post(url, params=params, json=payload)
+        if r.status_code >= 400:
+            raise GeminiError(f"Gemini HTTP {r.status_code}: {r.text[:300]}")
+        data = r.json()
+
     try:
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
     except Exception:
-        raise RuntimeError("gemini response parse failed")
+        raise GeminiError("Gemini response parse failed")
 
+    return parse_json_strict(text)
 
-# -----------------------
-# Fallback (no AI / AI failed)
-# -----------------------
-def fallback_short(payload: AnalyzePayload, sources: List[SourceItem]) -> AnalyzeResponse:
-    c = normalize_text(payload.conviction, 220).lower()
-    if any(k in c for k in ["매출", "성장", "수요"]):
-        blind = Blindspot(
-            title="수요 성장 = 이익 성장? (가정 누락)",
-            valueLine="매출↑는 이익↑가 아닙니다. 마진이 꺾이면 시나리오는 끝납니다.",
-            detail="성장 스토리는 비용/가격/경쟁 앞에서 먼저 흔들립니다. ‘얼마나 벌 수 있는가’가 빠지면 확신은 방어력이 없습니다.",
-            severity="HIGH",
-        )
-    elif any(k in c for k in ["저평가", "밸류", "per", "p/e"]):
-        blind = Blindspot(
-            title="저평가가 아니라 ‘정당한 할인’",
-            valueLine="싸서 오르는 게 아니라, ‘싫어할 이유’가 사라져야 오릅니다.",
-            detail="멀티플은 선물이 아닙니다. 할인 요인이 유지되면 평균회귀는 오지 않습니다.",
-            severity="MED",
-        )
-    elif any(k in c for k in ["독점", "경쟁", "moat", "점유율"]):
-        blind = Blindspot(
-            title="해자(Moat)의 본질",
-            valueLine="점유율이 아니라 ‘가격 결정력’이 무너지면 끝입니다.",
-            detail="경쟁이 가격으로 들어오면 해자는 생각보다 빨리 무너집니다. ‘가격을 지킬 이유’가 문장에 없습니다.",
-            severity="HIGH",
-        )
+# =========================================================
+# Post-validate sources (no hallucinated URLs)
+# =========================================================
+
+def filter_sources_to_allowed(obj: Dict[str, Any], allowed_sources: List[Dict[str, Any]]) -> Dict[str, Any]:
+    allowed_urls = {s["url"] for s in allowed_sources}
+    url_to_title = {s["url"]: s["title"] for s in allowed_sources}
+
+    def clean_source_list(lst: Any) -> List[Dict[str, str]]:
+        if not isinstance(lst, list):
+            return []
+        out: List[Dict[str, str]] = []
+        for x in lst:
+            if not isinstance(x, dict):
+                continue
+            url = (x.get("url") or "").strip()
+            if url in allowed_urls:
+                out.append({"title": url_to_title.get(url, x.get("title", "") or ""), "url": url})
+        # dedup
+        seen = set()
+        uniq = []
+        for s in out:
+            if s["url"] in seen:
+                continue
+            seen.add(s["url"])
+            uniq.append(s)
+        return uniq
+
+    if "sources" in obj:
+        obj["sources"] = clean_source_list(obj["sources"])
+    if isinstance(obj.get("blindspot"), dict):
+        obj["blindspot"]["sources"] = clean_source_list(obj["blindspot"].get("sources", []))
+
+    if "sources_top" in obj:
+        obj["sources_top"] = clean_source_list(obj["sources_top"])
+    if isinstance(obj.get("evidences"), list):
+        for ev in obj["evidences"]:
+            if isinstance(ev, dict):
+                ev["sources"] = clean_source_list(ev.get("sources", []))
+
+    return obj
+
+def ensure_three_questions(obj: Dict[str, Any], field: str, conviction: str) -> None:
+    qs = obj.get(field)
+    if not isinstance(qs, list):
+        qs = []
+    qs = [str(x) for x in qs if isinstance(x, str) and x.strip()]
+    if len(qs) > 3:
+        qs = qs[:3]
+    while len(qs) < 3:
+        if len(qs) == 0:
+            qs.append(f"‘{conviction}’가 깨지는 숫자 기준(반증 조건)을 하나 정할 수 있습니까?")
+        elif len(qs) == 1:
+            qs.append(f"‘{conviction}’를 언제까지 검증할 겁니까? 다음 확인 시점을 날짜/이벤트로 고르세요.")
+        else:
+            qs.append(f"‘{conviction}’ 전제가 무너질 때 대응 계획은 무엇입니까? (손절/추가매수/유지 기준)")
+    obj[field] = qs
+
+# =========================================================
+# Core pipeline
+# =========================================================
+
+async def retrieve_context(asset: str, ticker: str, company: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    queries = build_queries(asset, ticker, company)
+    raw_hits: List[Dict[str, Any]] = []
+    try:
+        raw_hits = await web_search(queries, per_query=6)
+    except Exception:
+        raw_hits = []
+
+    sources = dedup_and_rank_sources(asset, raw_hits, limit=MAX_SOURCES)
+    if not sources:
+        return [], []
+    excerpts = await build_excerpts(asset, sources)
+    return sources, excerpts
+
+async def run_short(asset: str, ticker: str, company: str, conviction: str, force_refresh: bool) -> Dict[str, Any]:
+    conviction_norm = normalize_conviction(conviction)
+    ckey = cache_key("short", asset, ticker, conviction_norm, PROMPT_VERSION_SHORT)
+
+    if not force_refresh:
+        cached = await cache.get(ckey)
+        if cached:
+            return json.loads(cached)
+
+    sources, excerpts = await retrieve_context(asset, ticker, company)
+
+    context_sources_json = safe_json_dumps([
+        {
+            "id": s.get("id", ""),
+            "title": s.get("title", ""),
+            "url": s.get("url", ""),
+            "publisher": s.get("publisher", ""),
+            "published_at": s.get("published_at", ""),
+            "tier": s.get("tier", "other"),
+        }
+        for s in sources
+    ])
+    context_excerpts_json = safe_json_dumps(excerpts)
+
+    prompt = SHORT_USER_PROMPT_TEMPLATE.format(
+        prompt_version=PROMPT_VERSION_SHORT,
+        asset=asset,
+        ticker=ticker,
+        company=company,
+        conviction=conviction_norm,
+        now_iso=now_iso_kst(),
+        context_sources_json=context_sources_json,
+        context_excerpts_json=context_excerpts_json
+    )
+
+    try:
+        out = await gemini_generate_json(prompt, max_tokens=GEMINI_MAX_TOKENS_SHORT)
+    except GeminiError as e:
+        raise HTTPException(status_code=502, detail=f"LLM error: {str(e)}")
+
+    out["prompt_version"] = PROMPT_VERSION_SHORT
+    out["asset"] = asset
+    out["ticker"] = ticker
+    out["company"] = company
+    out["conviction_original"] = conviction_norm
+    out["as_of"] = out.get("as_of") or now_iso_kst()
+
+    out = filter_sources_to_allowed(out, sources)
+    ensure_three_questions(out, "questions", conviction_norm)
+
+    if not isinstance(out.get("sources"), list) or len(out["sources"]) == 0:
+        bs = out.get("blindspot") if isinstance(out.get("blindspot"), dict) else None
+        if bs and isinstance(bs.get("sources"), list):
+            out["sources"] = bs["sources"][:6]
+        else:
+            out["sources"] = []
+
+    await cache.set(ckey, safe_json_dumps(out), CACHE_TTL_SECONDS)
+    return out
+
+async def run_deep(asset: str, ticker: str, company: str, conviction: str, force_refresh: bool) -> Dict[str, Any]:
+    conviction_norm = normalize_conviction(conviction)
+    ckey = cache_key("deep", asset, ticker, conviction_norm, PROMPT_VERSION_DEEP)
+
+    if not force_refresh:
+        cached = await cache.get(ckey)
+        if cached:
+            return json.loads(cached)
+
+    sources, excerpts = await retrieve_context(asset, ticker, company)
+
+    context_sources_json = safe_json_dumps([
+        {
+            "id": s.get("id", ""),
+            "title": s.get("title", ""),
+            "url": s.get("url", ""),
+            "publisher": s.get("publisher", ""),
+            "published_at": s.get("published_at", ""),
+            "tier": s.get("tier", "other"),
+        }
+        for s in sources
+    ])
+    context_excerpts_json = safe_json_dumps(excerpts)
+
+    prompt = DEEP_USER_PROMPT_TEMPLATE.format(
+        prompt_version=PROMPT_VERSION_DEEP,
+        asset=asset,
+        ticker=ticker,
+        company=company,
+        conviction=conviction_norm,
+        now_iso=now_iso_kst(),
+        context_sources_json=context_sources_json,
+        context_excerpts_json=context_excerpts_json
+    )
+
+    try:
+        out = await gemini_generate_json(prompt, max_tokens=GEMINI_MAX_TOKENS_DEEP)
+    except GeminiError as e:
+        raise HTTPException(status_code=502, detail=f"LLM error: {str(e)}")
+
+    out["prompt_version"] = PROMPT_VERSION_DEEP
+    out["asset"] = asset
+    out["ticker"] = ticker
+    out["company"] = company
+    out["conviction_original"] = conviction_norm
+    out["as_of"] = out.get("as_of") or now_iso_kst()
+
+    out = filter_sources_to_allowed(out, sources)
+    ensure_three_questions(out, "counter_questions", conviction_norm)
+
+    if isinstance(out.get("evidences"), list):
+        if len(out["evidences"]) > 5:
+            out["evidences"] = out["evidences"][:5]
     else:
-        blind = Blindspot(
-            title="핵심 전제가 문장에 없음",
-            valueLine="‘왜 지금’과 ‘언제까지’가 비어있습니다.",
-            detail="좋은 논리는 시간/조건을 포함합니다. 지금 문장은 신념에 가깝고, 검증 가능한 조건이 적습니다.",
-            severity="MED",
-        )
+        out["evidences"] = []
 
-    questions = [
-        "이 논리가 깨지는 조건 1가지는 무엇입니까?",
-        "실적이 좋아도 주가가 떨어질 수 있는 이유를 말할 수 있습니까?",
-        "다음 분기에 반드시 확인할 ‘숫자’ 1개를 정할 수 있습니까?",
-    ]
+    await cache.set(ckey, safe_json_dumps(out), CACHE_TTL_SECONDS)
+    return out
 
-    return AnalyzeResponse(
-        asOf=now_iso(),
-        cached=False,
-        asset=payload.asset,
-        ticker=payload.ticker,
-        company=payload.company,
-        conviction=payload.conviction,
-        blindspot=blind,
-        questions=questions,
-        sources=sources,
-    )
-
-
-def fallback_deep(payload: DeepPayload, sources: List[SourceItem]) -> DeepReportResponse:
-    counters = [
-        CounterItem(
-            category="수요",
-            headline="수요는 ‘좋다’가 아니라 ‘지속’이 핵심입니다.",
-            evidence="수요가 늘어도 경기/금리/경쟁 변수로 꺾일 수 있습니다. ‘어떤 지표로 지속을 확인할지’가 빠지면 논리는 취약합니다.",
-            numbers=[],
-            source_refs=[],
-        ),
-        CounterItem(
-            category="마진",
-            headline="매출이 아니라 마진이 먼저 무너집니다.",
-            evidence="원가/판관비/가격경쟁이 붙는 순간, 매출 성장의 의미가 바뀝니다. 마진 방어 근거가 없으면 리스크가 커집니다.",
-            numbers=[],
-            source_refs=[],
-        ),
-        CounterItem(
-            category="밸류에이션",
-            headline="싸 보이는 건 이유가 있을 때가 많습니다.",
-            evidence="멀티플은 ‘평균’으로 돌아오는 게 아니라, 할인 요인이 제거될 때 움직입니다. 무엇이 해소되면 리레이팅 되는지 정의가 필요합니다.",
-            numbers=[],
-            source_refs=[],
-        ),
-    ]
-
-    questions = [
-        "당신의 논리가 깨지는 조건 1가지를 문장으로 고정할 수 있습니까?",
-        "손절/익절 기준은 가격이 아니라 ‘조건’으로 설명할 수 있습니까?",
-        "다음 분기에 확인할 숫자 1개를 못 정하면, 무엇을 믿고 있습니까?",
-    ]
-
-    return DeepReportResponse(
-        asOf=now_iso(),
-        cached=False,
-        asset=payload.asset,
-        ticker=payload.ticker,
-        company=payload.company,
-        conviction=payload.conviction,
-        summary="논리의 핵심 전제가 ‘조건/지표’로 고정되지 않아 방어력이 낮습니다. 반대 시나리오를 숫자와 출처로 잠그는 단계가 필요합니다.",
-        counters=counters,
-        questions=questions,
-        sources=sources,
-    )
-
-
-# -----------------------
-# Error handler (always JSON)
-# -----------------------
-@app.exception_handler(Exception)
-async def _all_exception_handler(request: Request, exc: Exception):
-    logger.exception(f"unhandled error: {exc}")
-    return JSONResponse(
-        status_code=500,
-        content={"error": "internal_error", "message": "Internal Server Error"},
-    )
-
-
-# -----------------------
+# =========================================================
 # Routes
-# -----------------------
+# =========================================================
+
 @app.get("/health")
 async def health():
     return {
         "ok": True,
-        "time": now_iso(),
-        "cache": cache.stats(),
-        "has_SERVER_API_KEY": bool(SERVER_API_KEY),
-        "has_SERPER_API_KEY": bool(SERPER_API_KEY),
-        "has_GEMINI_API_KEY": bool(GEMINI_API_KEY),
-        "models": {"analyze": GEMINI_MODEL_ANALYZE, "deep": GEMINI_MODEL_DEEP},
+        "name": APP_NAME,
+        "search_provider": SEARCH_PROVIDER,
+        "has_serper_key": bool(SERPER_API_KEY),
+        "has_brave_key": bool(BRAVE_API_KEY),
+        "has_gemini_key": bool(GEMINI_API_KEY),
+        "model": GEMINI_MODEL,
+        "cache_ttl_seconds": CACHE_TTL_SECONDS
     }
 
+@app.post("/v1/analyze")
+async def analyze(req: AnalyzeRequest):
+    ticker = req.ticker.strip()
+    company = (req.company or "Unknown").strip()
+    conviction_norm = normalize_conviction(req.conviction)
 
-@app.post("/v1/analyze", response_model=AnalyzeResponse)
-async def analyze(payload: AnalyzePayload, x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
-    require_server_key(x_api_key)
+    if len(conviction_norm) < 10:
+        raise HTTPException(status_code=400, detail="conviction must be at least 10 characters")
 
-    payload.ticker = normalize_text(payload.ticker, 20).upper()
-    payload.company = normalize_text(payload.company or "Unknown", 80)
-    payload.conviction = normalize_text(payload.conviction, 300)
+    asset = infer_asset(req.asset, ticker)
+    return await run_short(asset, ticker, company, conviction_norm, req.force_refresh)
 
-    ck = make_cache_key("analyze", payload.model_dump())
-    if not payload.forceRefresh:
-        hit = cache.get(ck)
-        if hit:
-            hit["cached"] = True
-            return hit
+@app.post("/v1/short-report")
+async def short_report(req: AnalyzeRequest):
+    return await analyze(req)
 
-    # sources (optional)
-    query = build_search_query(payload.asset, payload.ticker, payload.company, payload.conviction)
-    hl, gl = locale_to_serper(payload.locale, payload.asset)
-    sources = await serper_search_sources(query, hl=hl, gl=gl, num=5)
+@app.post("/v1/deep-report")
+async def deep_report(req: DeepReportRequest):
+    ticker = req.ticker.strip()
+    company = (req.company or "Unknown").strip()
+    conviction_norm = normalize_conviction(req.conviction)
 
-    # AI (optional)
-    try:
-        if GEMINI_API_KEY:
-            prompt = build_analyze_prompt(payload, sources)
-            raw = await gemini_generate(GEMINI_MODEL_ANALYZE, prompt)
-            data = extract_first_json(raw)
+    if len(conviction_norm) < 10:
+        raise HTTPException(status_code=400, detail="conviction must be at least 10 characters")
 
-            blind = data.get("blindspot") or {}
-            qs = data.get("questions") or []
+    asset = infer_asset(req.asset, ticker)
+    return await run_deep(asset, ticker, company, conviction_norm, req.force_refresh)
 
-            resp = AnalyzeResponse(
-                asOf=now_iso(),
-                cached=False,
-                asset=payload.asset,
-                ticker=payload.ticker,
-                company=payload.company,
-                conviction=payload.conviction,
-                blindspot=Blindspot(
-                    title=normalize_text(blind.get("title", "핵심 전제 점검"), 80),
-                    valueLine=normalize_text(blind.get("valueLine", "불편한 사실 1개가 빠져 있습니다."), 120),
-                    detail=normalize_text(blind.get("detail", "전제를 조건과 지표로 고정하지 않으면 논리는 쉽게 흔들립니다."), 500),
-                    severity=(blind.get("severity") or "MED").replace("MEDIUM", "MED").upper(),  # 방어
-                ),
-                questions=[normalize_text(q, 140) for q in (qs[:3] if isinstance(qs, list) else [])] or fallback_short(payload, sources).questions,
-                sources=sources,
-            )
-
-            out = resp.model_dump()
-            cache.set(ck, out)
-            return out
-
-        # no gemini key → fallback
-        resp = fallback_short(payload, sources).model_dump()
-        cache.set(ck, resp)
-        return resp
-
-    except Exception as e:
-        logger.warning(f"analyze ai failed -> fallback: {e}")
-        resp = fallback_short(payload, sources).model_dump()
-        cache.set(ck, resp)
-        return resp
-
-
-@app.post("/v1/deep-report", response_model=DeepReportResponse)
-async def deep_report(payload: DeepPayload, x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
-    require_server_key(x_api_key)
-
-    payload.ticker = normalize_text(payload.ticker, 20).upper()
-    payload.company = normalize_text(payload.company or "Unknown", 80)
-    payload.conviction = normalize_text(payload.conviction, 300)
-
-    ck = make_cache_key("deep", payload.model_dump())
-    if not payload.forceRefresh:
-        hit = cache.get(ck)
-        if hit:
-            hit["cached"] = True
-            return hit
-
-    query = build_search_query(payload.asset, payload.ticker, payload.company, payload.conviction)
-    hl, gl = locale_to_serper(payload.locale, payload.asset)
-    sources = await serper_search_sources(query, hl=hl, gl=gl, num=6)
-
-    try:
-        if GEMINI_API_KEY:
-            prompt = build_deep_prompt(payload, sources)
-            raw = await gemini_generate(GEMINI_MODEL_DEEP, prompt)
-            data = extract_first_json(raw)
-
-            counters_raw = data.get("counters") or []
-            questions_raw = data.get("questions") or []
-            summary = normalize_text(data.get("summary", ""), 300) or "반대 근거를 3~5개 축으로 잠급니다. 전제는 숫자와 출처로 고정되어야 합니다."
-
-            counters: List[CounterItem] = []
-            if isinstance(counters_raw, list):
-                for it in counters_raw[:5]:
-                    if not isinstance(it, dict):
-                        continue
-                    counters.append(
-                        CounterItem(
-                            category=normalize_text(str(it.get("category", "리스크")), 20),
-                            headline=normalize_text(str(it.get("headline", "")), 120),
-                            evidence=normalize_text(str(it.get("evidence", "")), 600),
-                            numbers=(it.get("numbers") if isinstance(it.get("numbers"), list) else []),
-                            source_refs=(it.get("source_refs") if isinstance(it.get("source_refs"), list) else []),
-                        )
-                    )
-
-            if not counters:
-                # AI가 이상하게 주면 fallback 카운터라도 넣기
-                counters = fallback_deep(payload, sources).counters
-
-            questions = [normalize_text(q, 140) for q in (questions_raw[:3] if isinstance(questions_raw, list) else [])]
-            if len(questions) < 3:
-                questions = fallback_deep(payload, sources).questions
-
-            resp = DeepReportResponse(
-                asOf=now_iso(),
-                cached=False,
-                asset=payload.asset,
-                ticker=payload.ticker,
-                company=payload.company,
-                conviction=payload.conviction,
-                summary=summary,
-                counters=counters,
-                questions=questions,
-                sources=sources,
-            )
-
-            out = resp.model_dump()
-            cache.set(ck, out)
-            return out
-
-        resp = fallback_deep(payload, sources).model_dump()
-        cache.set(ck, resp)
-        return resp
-
-    except Exception as e:
-        logger.warning(f"deep-report ai failed -> fallback: {e}")
-        resp = fallback_deep(payload, sources).model_dump()
-        cache.set(ck, resp)
-        return resp
+if _name_ == "_main_":
+    import uvicorn
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)

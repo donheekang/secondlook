@@ -1,3 +1,4 @@
+# main.py
 import os
 import re
 import json
@@ -34,27 +35,29 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 
 # =========================================================
-# Env helpers
+# Env helpers (Render에서 빈 값/오타로 죽는 것 방지)
 # =========================================================
 def env_str(name: str, default: str = "") -> str:
     v = os.getenv(name)
     if v is None:
         return default
     v = v.strip()
-    return v if v else default
+    return v if v != "" else default
+
 
 def env_int(name: str, default: int) -> int:
     v = os.getenv(name)
-    if v is None or not v.strip():
+    if v is None or v.strip() == "":
         return default
     try:
         return int(v.strip())
     except Exception:
         return default
 
+
 def env_float(name: str, default: float) -> float:
     v = os.getenv(name)
-    if v is None or not v.strip():
+    if v is None or v.strip() == "":
         return default
     try:
         return float(v.strip())
@@ -71,7 +74,7 @@ PROMPT_VERSION_SHORT = env_str("PROMPT_VERSION_SHORT", "short.v1.0")
 PROMPT_VERSION_DEEP = env_str("PROMPT_VERSION_DEEP", "deep.v1.0")
 RETRIEVAL_VERSION = env_str("RETRIEVAL_VERSION", "r1")
 
-CACHE_TTL_SECONDS = env_int("CACHE_TTL_SECONDS", 86400)
+CACHE_TTL_SECONDS = env_int("CACHE_TTL_SECONDS", 86400)  # 24h
 
 SEARCH_PROVIDER = env_str("SEARCH_PROVIDER", "serper").lower()
 SERPER_API_KEY = env_str("SERPER_API_KEY", "")
@@ -80,8 +83,10 @@ BRAVE_API_KEY = env_str("BRAVE_API_KEY", "")
 GEMINI_API_KEY = env_str("GEMINI_API_KEY", "")
 GEMINI_MODEL = env_str("GEMINI_MODEL", "gemini-3-flash-preview")
 GEMINI_TEMPERATURE = env_float("GEMINI_TEMPERATURE", 0.2)
-GEMINI_MAX_TOKENS_SHORT = env_int("GEMINI_MAX_TOKENS_SHORT", 1600)
-GEMINI_MAX_TOKENS_DEEP = env_int("GEMINI_MAX_TOKENS_DEEP", 3200)
+
+# 기본값은 약간 넉넉하게(출력 잘리면 JSON 깨짐 → 502 원인)
+GEMINI_MAX_TOKENS_SHORT = env_int("GEMINI_MAX_TOKENS_SHORT", 2048)
+GEMINI_MAX_TOKENS_DEEP = env_int("GEMINI_MAX_TOKENS_DEEP", 4096)
 
 REDIS_URL = env_str("REDIS_URL", "")
 
@@ -93,6 +98,7 @@ MAX_FETCH_BYTES = env_int("MAX_FETCH_BYTES", 800_000)
 HTTP_TIMEOUT = env_float("HTTP_TIMEOUT", 12.0)
 
 ALLOWED_ORIGINS = env_str("ALLOWED_ORIGINS", "*")
+
 USER_AGENT = env_str(
     "USER_AGENT",
     "Mozilla/5.0 (compatible; TheShortBot/1.0; +https://secondlook.onrender.com)"
@@ -198,7 +204,7 @@ Return ONLY JSON.
 
 
 # =========================================================
-# JSON Schemas (Gemini JSON mode)
+# JSON Schemas
 # =========================================================
 SHORT_SCHEMA: Dict[str, Any] = {
     "type": "object",
@@ -301,7 +307,7 @@ DEEP_SCHEMA: Dict[str, Any] = {
 
 
 # =========================================================
-# Cache ✅ (FIXED __init__)
+# Cache (Redis optional) — ✅ correct __init__
 # =========================================================
 class TTLCache:
     def __init__(self) -> None:
@@ -322,6 +328,7 @@ class TTLCache:
     async def set(self, key: str, val: str, ttl: int) -> None:
         async with self._lock:
             self._mem[key] = (time.time() + ttl, val)
+
 
 class Cache:
     def __init__(self) -> None:
@@ -361,6 +368,7 @@ class Cache:
                 pass
         await self.mem.set(key, val, ttl)
 
+
 cache = Cache()
 
 
@@ -373,17 +381,21 @@ async def lifespan(app: FastAPI):
     yield
     await cache.close()
 
+
 app = FastAPI(title=APP_NAME, lifespan=lifespan)
 
+# CORS
 if ALLOWED_ORIGINS.strip() == "*":
     origins = ["*"]
+    allow_credentials = False  # "*" + credentials 는 브라우저에서 불가
 else:
     origins = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
+    allow_credentials = True
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    allow_credentials=True,
+    allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -400,19 +412,21 @@ class AnalyzeRequest(BaseModel):
     asset: Optional[str] = Field(default=None, description="US|KR|COIN")
     force_refresh: bool = Field(default=False)
 
+
 class DeepReportRequest(AnalyzeRequest):
     pass
 
 
 # =========================================================
-# Utils
+# Utilities
 # =========================================================
 def now_iso() -> str:
     return datetime.now(KST).isoformat(timespec="seconds")
 
+
 def normalize_conviction(text: str) -> str:
-    t = re.sub(r"\s+", " ", text.strip())
-    return t
+    return re.sub(r"\s+", " ", text.strip())
+
 
 def infer_asset(asset: Optional[str], ticker: str) -> str:
     if asset:
@@ -429,19 +443,24 @@ def infer_asset(asset: Optional[str], ticker: str) -> str:
         return "COIN"
     return "US"
 
+
 def sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
 
 def cache_key(endpoint: str, asset: str, ticker: str, conviction_norm: str, prompt_version: str) -> str:
     raw = f"{endpoint}|{asset}|{ticker}|{conviction_norm}|{prompt_version}|{GEMINI_MODEL}|{RETRIEVAL_VERSION}"
     return "th:" + sha256_hex(raw)
 
+
 def safe_json_dumps(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), sort_keys=False)
+
 
 def extract_domain(url: str) -> str:
     m = re.match(r"^https?://([^/]+)", url)
     return (m.group(1) if m else "").lower()
+
 
 def is_probably_pdf(url: str, content_type: Optional[str]) -> bool:
     if url.lower().endswith(".pdf"):
@@ -452,11 +471,13 @@ def is_probably_pdf(url: str, content_type: Optional[str]) -> bool:
 
 
 # =========================================================
-# Sentence extraction heuristics
+# Sentence selection (simple heuristic)
 # =========================================================
 def split_sentences(text: str) -> List[str]:
-    t = re.sub(r"[ \t]+", " ", text.replace("\r", "\n"))
+    t = text.replace("\r", "\n")
+    t = re.sub(r"[ \t]+", " ", t)
     chunks = re.split(r"\n{1,}", t)
+
     out: List[str] = []
     for ch in chunks:
         ch = ch.strip()
@@ -467,19 +488,22 @@ def split_sentences(text: str) -> List[str]:
             s = p.strip()
             if 30 <= len(s) <= 320:
                 out.append(s)
+
     # dedupe
     seen = set()
     uniq: List[str] = []
     for s in out:
-        k = s[:60]
-        if k in seen:
+        key = s[:60]
+        if key in seen:
             continue
-        seen.add(k)
+        seen.add(key)
         uniq.append(s)
     return uniq
 
+
 def slot_to_tag(slot: str) -> str:
     return {"A": "demand", "B": "margin", "C": "competition", "D": "regulation", "E": "valuation"}.get(slot, "other")
+
 
 def score_sentence(sentence: str, asset: str) -> Tuple[float, List[str], str]:
     s_low = sentence.lower()
@@ -502,7 +526,7 @@ def score_sentence(sentence: str, asset: str) -> Tuple[float, List[str], str]:
 
     slot_scores: Dict[str, float] = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0, "E": 0.0}
 
-    def bump(slot: str, kws: List[str], w: float):
+    def bump(slot: str, kws: List[str], w: float) -> None:
         for kw in kws:
             if kw.lower() in s_low:
                 slot_scores[slot] += w
@@ -525,7 +549,7 @@ def score_sentence(sentence: str, asset: str) -> Tuple[float, List[str], str]:
 
 
 # =========================================================
-# Search
+# Search providers
 # =========================================================
 async def search_serper(query: str, num: int = 6) -> List[Dict[str, Any]]:
     if not SERPER_API_KEY:
@@ -537,10 +561,11 @@ async def search_serper(query: str, num: int = 6) -> List[Dict[str, Any]]:
         r = await client.post(url, headers=headers, json=payload)
         r.raise_for_status()
         data = r.json()
-    out = []
+    out: List[Dict[str, Any]] = []
     for item in data.get("organic", []) or []:
         out.append({"title": item.get("title", ""), "url": item.get("link", ""), "snippet": item.get("snippet", "")})
     return [x for x in out if x.get("url")]
+
 
 async def search_brave(query: str, count: int = 6) -> List[Dict[str, Any]]:
     if not BRAVE_API_KEY:
@@ -552,11 +577,12 @@ async def search_brave(query: str, count: int = 6) -> List[Dict[str, Any]]:
         r = await client.get(url, headers=headers, params=params)
         r.raise_for_status()
         data = r.json()
-    out = []
+    out: List[Dict[str, Any]] = []
     web = (data.get("web") or {}).get("results") or []
     for item in web:
         out.append({"title": item.get("title", ""), "url": item.get("url", ""), "snippet": item.get("description", "")})
     return [x for x in out if x.get("url")]
+
 
 async def web_search(queries: List[str], per_query: int = 6) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
@@ -573,6 +599,7 @@ async def web_search(queries: List[str], per_query: int = 6) -> List[Dict[str, A
             hits = []
         results.extend(hits)
     return results
+
 
 def build_queries(asset: str, ticker: str, company: str) -> List[str]:
     base = f"{ticker} {company}".strip()
@@ -601,12 +628,16 @@ def build_queries(asset: str, ticker: str, company: str) -> List[str]:
         f"{up} exchange delisting notice",
     ]
 
+
 def tier_for_domain(asset: str, domain: str) -> str:
     d = domain.lower()
     primary_us = {"sec.gov"}
     primary_kr = {"dart.fss.or.kr", "kind.krx.co.kr", "krx.co.kr"}
     primary_coin = {"coinmarketcap.com", "coingecko.com"}
-    reputable = {"reuters.com", "ft.com", "wsj.com", "bloomberg.com", "finance.yahoo.com", "investing.com", "marketwatch.com", "seekingalpha.com"}
+    reputable = {
+        "reuters.com", "ft.com", "wsj.com", "bloomberg.com", "finance.yahoo.com",
+        "investing.com", "marketwatch.com", "seekingalpha.com",
+    }
     if asset == "US" and d in primary_us:
         return "primary"
     if asset == "KR" and d in primary_kr:
@@ -616,6 +647,7 @@ def tier_for_domain(asset: str, domain: str) -> str:
     if d in reputable:
         return "reputable"
     return "other"
+
 
 def dedup_and_rank_sources(asset: str, raw_hits: List[Dict[str, Any]], limit: int = MAX_SOURCES) -> List[Dict[str, Any]]:
     by_domain_count: Dict[str, int] = {}
@@ -627,7 +659,8 @@ def dedup_and_rank_sources(asset: str, raw_hits: List[Dict[str, Any]], limit: in
         dom = extract_domain(url)
         tier = tier_for_domain(asset, dom)
         s = 5.0 if tier == "primary" else 2.5 if tier == "reputable" else 0.5
-        if re.search(r"\d", (h.get("snippet") or "").lower()):
+        snippet = (h.get("snippet") or "").lower()
+        if re.search(r"\d", snippet):
             s += 1.0
         return s
 
@@ -662,19 +695,26 @@ def dedup_and_rank_sources(asset: str, raw_hits: List[Dict[str, Any]], limit: in
 
 
 # =========================================================
-# Fetch & excerpts
+# Fetch & Excerpts
 # =========================================================
 async def fetch_text(client: httpx.AsyncClient, sem: asyncio.Semaphore, url: str) -> Tuple[str, Optional[str]]:
     async with sem:
-        r = await client.get(url, headers={"Accept": "*/*"})
-        ctype = r.headers.get("content-type")
+        try:
+            r = await client.get(url, headers={"Accept": "*/*"})
+        except Exception:
+            return "", None
+
+        content_type = r.headers.get("content-type")
+        if r.status_code >= 400:
+            return "", content_type
+
         data = r.content[:MAX_FETCH_BYTES]
 
-        if is_probably_pdf(url, ctype):
-            return "", ctype
+        if is_probably_pdf(url, content_type):
+            return "", content_type
 
         if BeautifulSoup is None:
-            return data.decode(errors="ignore"), ctype
+            return data.decode(errors="ignore"), content_type
 
         html = data.decode(errors="ignore")
         soup = BeautifulSoup(html, "html.parser")
@@ -686,18 +726,22 @@ async def fetch_text(client: httpx.AsyncClient, sem: asyncio.Semaphore, url: str
         text = soup.get_text(separator="\n")
         lines = [ln.strip() for ln in text.splitlines()]
         lines = [ln for ln in lines if ln and len(ln) < 500]
-        return "\n".join(lines), ctype
+        return "\n".join(lines), content_type
+
 
 async def build_excerpts(asset: str, sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     sem = asyncio.Semaphore(FETCH_CONCURRENCY)
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT}, follow_redirects=True) as client:
+
+    async with httpx.AsyncClient(
+        timeout=HTTP_TIMEOUT,
+        headers={"User-Agent": USER_AGENT},
+        follow_redirects=True,
+    ) as client:
 
         async def process_source(src: Dict[str, Any]) -> List[Dict[str, Any]]:
-            try:
-                text, ctype = await fetch_text(client, sem, src["url"])
-            except Exception:
-                return []
-            if not text or is_probably_pdf(src["url"], ctype):
+            url = src["url"]
+            text, ctype = await fetch_text(client, sem, url)
+            if not text or is_probably_pdf(url, ctype):
                 return []
 
             sents = split_sentences(text)
@@ -707,28 +751,33 @@ async def build_excerpts(asset: str, sources: List[Dict[str, Any]]) -> List[Dict
                 scored.append((sc, sent, tags, conf))
             scored.sort(key=lambda x: x[0], reverse=True)
 
-            out_local = []
+            out_local: List[Dict[str, Any]] = []
             for sc, sent, tags, conf in scored[:MAX_EXCERPTS_PER_SOURCE]:
                 out_local.append({"source_id": src["id"], "excerpt": sent, "tag": tags, "confidence": conf})
             return out_local
 
         chunks = await asyncio.gather(*[process_source(s) for s in sources], return_exceptions=True)
 
-    out: List[Dict[str, Any]] = []
+    excerpts: List[Dict[str, Any]] = []
     for ch in chunks:
         if isinstance(ch, Exception):
             continue
-        out.extend(ch)
+        excerpts.extend(ch)
 
-    out.sort(key=lambda e: (-(1 if re.search(r"\d", e.get("excerpt", "")) else 0), e.get("source_id", "")))
-    return out[:MAX_TOTAL_EXCERPTS]
+    def excerpt_rank(e: Dict[str, Any]) -> Tuple[int, str]:
+        has_digit = 1 if re.search(r"\d", e.get("excerpt", "")) else 0
+        return (-has_digit, e.get("source_id", ""))
+
+    excerpts.sort(key=excerpt_rank)
+    return excerpts[:MAX_TOTAL_EXCERPTS]
 
 
 # =========================================================
-# Gemini (REST) + JSON repair
+# Gemini (REST) — Structured output + repair + retries
 # =========================================================
 class GeminiError(Exception):
     pass
+
 
 def _strip_code_fences(s: str) -> str:
     s = s.strip()
@@ -736,6 +785,7 @@ def _strip_code_fences(s: str) -> str:
         s = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", s)
         s = re.sub(r"\s*```$", "", s)
     return s.strip()
+
 
 def _extract_first_json_block(s: str) -> Optional[str]:
     s = _strip_code_fences(s)
@@ -779,65 +829,102 @@ def _extract_first_json_block(s: str) -> Optional[str]:
                 stack.pop()
     return None
 
+
 def parse_json_strict(text: str) -> Dict[str, Any]:
+    # 1) direct
     try:
-        return json.loads(text)
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
     except Exception:
         pass
 
+    # 2) extract first block
     cand = _extract_first_json_block(text)
     if cand:
-        return json.loads(cand)
+        obj = json.loads(cand)
+        if isinstance(obj, dict):
+            return obj
 
     raise GeminiError("Model did not return valid JSON")
 
-async def _gemini_generate_raw(user_prompt: str, max_tokens: int, schema: Optional[Dict[str, Any]]) -> str:
-    if not GEMINI_API_KEY:
-        raise GeminiError("GEMINI_API_KEY is missing")
 
+async def _gemini_post(payload: Dict[str, Any]) -> Dict[str, Any]:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    headers = {
+        "x-goog-api-key": GEMINI_API_KEY,
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT * 2) as client:
+        r = await client.post(url, headers=headers, json=payload)
+        # retry 대상 상태코드(일시 장애)
+        if r.status_code in (429, 500, 502, 503, 504):
+            raise GeminiError(f"Gemini transient HTTP {r.status_code}: {r.text[:300]}")
+        if r.status_code >= 400:
+            raise GeminiError(f"Gemini HTTP {r.status_code}: {r.text[:800]}")
+        return r.json()
 
-    generation: Dict[str, Any] = {
+
+def _build_generation_config(max_tokens: int, schema: Optional[Dict[str, Any]], schema_key: Optional[str]) -> Dict[str, Any]:
+    gen: Dict[str, Any] = {
         "temperature": GEMINI_TEMPERATURE,
         "maxOutputTokens": max_tokens,
         "candidateCount": 1,
         "responseMimeType": "application/json",
     }
-    if schema is not None:
-        generation["responseSchema"] = schema  # ✅ 중요: responseSchema
+    if schema is not None and schema_key:
+        gen[schema_key] = schema
+    return gen
 
-    payload: Dict[str, Any] = {
-        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-        "generationConfig": generation,
-    }
 
-    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json", "User-Agent": USER_AGENT}
+async def _gemini_generate_raw(user_prompt: str, max_tokens: int, schema: Optional[Dict[str, Any]]) -> str:
+    if not GEMINI_API_KEY:
+        raise GeminiError("GEMINI_API_KEY is missing")
 
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT * 2) as client:
-        r = await client.post(url, headers=headers, json=payload)
+    # 1) responseJsonSchema 우선 (generativelanguage REST 기준)
+    # 2) 혹시 모를 호환: responseSchema
+    # 3) 마지막: schema 없이 JSON mime only
+    schema_keys = ["responseJsonSchema", "responseSchema", None]
 
-        if r.status_code >= 400:
-            # schema 필드 미지원이면 1회 schema 없이 재시도
-            if schema is not None:
-                logger.warning("Gemini schema failed (%s). Retrying without schema.", r.status_code)
-                return await _gemini_generate_raw(user_prompt, max_tokens, schema=None)
-            raise GeminiError(f"Gemini HTTP {r.status_code}: {r.text[:800]}")
+    last_err: Optional[Exception] = None
 
-        data = r.json()
+    for schema_key in schema_keys:
+        generation = _build_generation_config(max_tokens=max_tokens, schema=schema, schema_key=schema_key)
 
-    try:
-        parts = data["candidates"][0]["content"]["parts"]
-        texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
-        text = "\n".join([t for t in texts if t])
-        if not text:
-            raise KeyError
-        return text
-    except Exception:
-        raise GeminiError("Gemini response parse failed")
+        payload: Dict[str, Any] = {
+            "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+            "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+            "generationConfig": generation,
+        }
+
+        # 간단 재시도(네트워크/429/5xx)
+        for attempt in range(3):
+            try:
+                data = await _gemini_post(payload)
+                parts = data["candidates"][0]["content"]["parts"]
+                texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
+                text = "\n".join([t for t in texts if t]).strip()
+                if not text:
+                    raise GeminiError("Gemini returned empty text")
+                return text
+            except GeminiError as e:
+                last_err = e
+                # schema 키가 원인일 수도 있으니 다음 schema_key로 넘어가게 함
+                msg = str(e)
+                if "Invalid JSON payload" in msg or "Unknown name" in msg or "responseJsonSchema" in msg or "responseSchema" in msg:
+                    break
+                # transient면 backoff
+                if "transient" in msg and attempt < 2:
+                    await asyncio.sleep(0.8 * (attempt + 1))
+                    continue
+                break
+
+    raise GeminiError(str(last_err) if last_err else "Gemini request failed")
+
 
 async def gemini_generate_json(user_prompt: str, max_tokens: int, schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    raw = await _gemini_generate_raw(user_prompt, max_tokens, schema=schema)
+    raw = await _gemini_generate_raw(user_prompt, max_tokens=max_tokens, schema=schema)
     try:
         return parse_json_strict(raw)
     except Exception:
@@ -846,31 +933,31 @@ async def gemini_generate_json(user_prompt: str, max_tokens: int, schema: Option
             "You MUST output ONLY valid JSON that matches the schema. No markdown. No extra text.\n\n"
             f"INPUT:\n{raw}\n\nOUTPUT: JSON only."
         )
-        raw2 = await _gemini_generate_raw(repair_prompt, max_tokens, schema=schema)
+        raw2 = await _gemini_generate_raw(repair_prompt, max_tokens=max_tokens, schema=schema)
         return parse_json_strict(raw2)
 
 
 # =========================================================
-# Post validate sources
+# Post-validate sources (no hallucinated urls)
 # =========================================================
 def filter_sources_to_allowed(obj: Dict[str, Any], allowed_sources: List[Dict[str, Any]]) -> Dict[str, Any]:
     allowed_urls = {s["url"] for s in allowed_sources}
     url_to_title = {s["url"]: s["title"] for s in allowed_sources}
 
-    def clean(lst: Any) -> List[Dict[str, str]]:
+    def clean_source_list(lst: Any) -> List[Dict[str, str]]:
         if not isinstance(lst, list):
             return []
-        out: List[Dict[str, str]] = []
+        out_local: List[Dict[str, str]] = []
         for x in lst:
             if not isinstance(x, dict):
                 continue
             url = (x.get("url") or "").strip()
             if url in allowed_urls:
-                out.append({"title": url_to_title.get(url, x.get("title", "") or ""), "url": url})
+                out_local.append({"title": url_to_title.get(url, x.get("title", "") or ""), "url": url})
         # dedup
         seen = set()
-        uniq = []
-        for s in out:
+        uniq: List[Dict[str, str]] = []
+        for s in out_local:
             if s["url"] in seen:
                 continue
             seen.add(s["url"])
@@ -878,38 +965,93 @@ def filter_sources_to_allowed(obj: Dict[str, Any], allowed_sources: List[Dict[st
         return uniq
 
     if "sources" in obj:
-        obj["sources"] = clean(obj["sources"])
+        obj["sources"] = clean_source_list(obj["sources"])
     if isinstance(obj.get("blindspot"), dict):
-        obj["blindspot"]["sources"] = clean(obj["blindspot"].get("sources", []))
+        obj["blindspot"]["sources"] = clean_source_list(obj["blindspot"].get("sources", []))
+
     if "sources_top" in obj:
-        obj["sources_top"] = clean(obj["sources_top"])
+        obj["sources_top"] = clean_source_list(obj["sources_top"])
     if isinstance(obj.get("evidences"), list):
         for ev in obj["evidences"]:
             if isinstance(ev, dict):
-                ev["sources"] = clean(ev.get("sources", []))
+                ev["sources"] = clean_source_list(ev.get("sources", []))
     return obj
+
 
 def ensure_three_questions(obj: Dict[str, Any], field: str, conviction: str) -> None:
     qs = obj.get(field)
     if not isinstance(qs, list):
         qs = []
     qs = [str(x) for x in qs if isinstance(x, str) and x.strip()]
-    qs = qs[:3]
+    if len(qs) > 3:
+        qs = qs[:3]
     while len(qs) < 3:
         if len(qs) == 0:
             qs.append(f"‘{conviction}’가 깨지는 숫자 기준(반증 조건)을 하나 정할 수 있습니까?")
         elif len(qs) == 1:
             qs.append(f"‘{conviction}’를 언제까지 검증할 겁니까? 다음 확인 시점을 날짜/이벤트로 고르세요.")
         else:
-            qs.append(f"‘{conviction}’ 전제가 무너질 때 대응 계획은 무엇입니까? (손절/추가매수/유지 기준)")
+            qs.append(f"‘{conviction}’ 전제가 무너질 때 대응 계획은 무엇입니까? (유지/축소/정리 기준)")
     obj[field] = qs
 
 
 # =========================================================
-# Pipeline
+# Fallback payloads (LLM 실패해도 앱이 안 죽도록)
+# =========================================================
+def fallback_short(asset: str, ticker: str, company: str, conviction: str, reason: str) -> Dict[str, Any]:
+    return {
+        "prompt_version": PROMPT_VERSION_SHORT,
+        "as_of": now_iso(),
+        "asset": asset,
+        "ticker": ticker,
+        "company": company,
+        "conviction_original": conviction,
+        "blindspot": {
+            "title": "모델 응답 오류",
+            "value_line": "근거 수치/팩트가 확인되지 않았습니다.",
+            "detail": f"서버가 리포트를 생성하는 중 오류가 발생했습니다. ({reason})\n잠시 후 다시 시도하거나 force_refresh=true로 재시도하세요.",
+            "severity": "high",
+            "confidence": 0.2,
+            "next_metric": "다음 분기 실적/공시에서 확인할 숫자 1개를 지정하세요.",
+            "sources": [],
+        },
+        "questions": [
+            f"‘{conviction}’가 깨지는 반증 조건(숫자 기준)은 무엇입니까?",
+            f"‘{conviction}’를 검증할 다음 확인 시점(날짜/이벤트)은 언제입니까?",
+            f"‘{conviction}’가 틀리면 대응 계획은 무엇입니까?",
+        ],
+        "sources": [],
+    }
+
+
+def fallback_deep(asset: str, ticker: str, company: str, conviction: str, reason: str) -> Dict[str, Any]:
+    return {
+        "prompt_version": PROMPT_VERSION_DEEP,
+        "as_of": now_iso(),
+        "asset": asset,
+        "ticker": ticker,
+        "company": company,
+        "conviction_original": conviction,
+        "conviction_parsed": {
+            "claim": conviction,
+            "assumptions": ["근거/출처가 충분히 확보되지 않았습니다."],
+            "time_horizon": "불명",
+        },
+        "evidences": [],
+        "counter_questions": [
+            f"‘{conviction}’가 깨지는 숫자 기준(반증 조건)을 하나 정할 수 있습니까?",
+            f"‘{conviction}’를 언제까지 검증할 겁니까? 다음 확인 시점을 날짜/이벤트로 고르세요.",
+            f"‘{conviction}’ 전제가 무너질 때 대응 계획은 무엇입니까? (유지/축소/정리 기준)",
+        ],
+        "sources_top": [],
+    }
+
+
+# =========================================================
+# Core pipeline
 # =========================================================
 async def retrieve_context(asset: str, ticker: str, company: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    # 키 없으면 검색 스킵
+    # 키 없으면 검색 스킵 (그래도 LLM은 "근거 없음" 형태로 JSON 생성 가능)
     if SEARCH_PROVIDER == "serper" and not SERPER_API_KEY:
         return [], []
     if SEARCH_PROVIDER == "brave" and not BRAVE_API_KEY:
@@ -923,6 +1065,7 @@ async def retrieve_context(asset: str, ticker: str, company: str) -> Tuple[List[
     excerpts = await build_excerpts(asset, sources)
     return sources, excerpts
 
+
 async def run_short(asset: str, ticker: str, company: str, conviction: str, force_refresh: bool) -> Dict[str, Any]:
     conviction_norm = normalize_conviction(conviction)
     ckey = cache_key("short", asset, ticker, conviction_norm, PROMPT_VERSION_SHORT)
@@ -930,12 +1073,18 @@ async def run_short(asset: str, ticker: str, company: str, conviction: str, forc
     if not force_refresh:
         cached = await cache.get(ckey)
         if cached:
-            return json.loads(cached)
+            try:
+                return json.loads(cached)
+            except Exception:
+                pass
 
     sources, excerpts = await retrieve_context(asset, ticker, company)
 
-    context_sources_json = safe_json_dumps(sources)
-    context_excerpts_json = safe_json_dumps(excerpts)
+    # prompt에 넣을 소스는 필요한 필드만(토큰 절약)
+    prompt_sources = [
+        {"id": s["id"], "title": s["title"], "url": s["url"], "publisher": s["publisher"], "published_at": s["published_at"], "tier": s["tier"]}
+        for s in sources
+    ]
 
     prompt = SHORT_USER_PROMPT_TEMPLATE.format(
         prompt_version=PROMPT_VERSION_SHORT,
@@ -944,15 +1093,17 @@ async def run_short(asset: str, ticker: str, company: str, conviction: str, forc
         company=company,
         conviction=conviction_norm,
         now_iso=now_iso(),
-        context_sources_json=context_sources_json,
-        context_excerpts_json=context_excerpts_json,
+        context_sources_json=safe_json_dumps(prompt_sources),
+        context_excerpts_json=safe_json_dumps(excerpts),
     )
 
     try:
-        out = await gemini_generate_json(prompt, GEMINI_MAX_TOKENS_SHORT, schema=SHORT_SCHEMA)
-    except GeminiError as e:
-        raise HTTPException(status_code=502, detail=f"LLM error: {str(e)}")
+        out = await gemini_generate_json(prompt, max_tokens=GEMINI_MAX_TOKENS_SHORT, schema=SHORT_SCHEMA)
+    except Exception as e:
+        logger.exception("Gemini short failed")
+        out = fallback_short(asset, ticker, company, conviction_norm, reason=str(e)[:180])
 
+    # hard-fill
     out["prompt_version"] = PROMPT_VERSION_SHORT
     out["asset"] = asset
     out["ticker"] = ticker
@@ -963,8 +1114,17 @@ async def run_short(asset: str, ticker: str, company: str, conviction: str, forc
     out = filter_sources_to_allowed(out, sources)
     ensure_three_questions(out, "questions", conviction_norm)
 
+    # sources가 비어있으면 blindspot.sources로 채우기(가능할 때)
+    if not isinstance(out.get("sources"), list) or len(out["sources"]) == 0:
+        bs = out.get("blindspot") if isinstance(out.get("blindspot"), dict) else None
+        if bs and isinstance(bs.get("sources"), list):
+            out["sources"] = bs["sources"][:6]
+        else:
+            out["sources"] = []
+
     await cache.set(ckey, safe_json_dumps(out), CACHE_TTL_SECONDS)
     return out
+
 
 async def run_deep(asset: str, ticker: str, company: str, conviction: str, force_refresh: bool) -> Dict[str, Any]:
     conviction_norm = normalize_conviction(conviction)
@@ -973,12 +1133,17 @@ async def run_deep(asset: str, ticker: str, company: str, conviction: str, force
     if not force_refresh:
         cached = await cache.get(ckey)
         if cached:
-            return json.loads(cached)
+            try:
+                return json.loads(cached)
+            except Exception:
+                pass
 
     sources, excerpts = await retrieve_context(asset, ticker, company)
 
-    context_sources_json = safe_json_dumps(sources)
-    context_excerpts_json = safe_json_dumps(excerpts)
+    prompt_sources = [
+        {"id": s["id"], "title": s["title"], "url": s["url"], "publisher": s["publisher"], "published_at": s["published_at"], "tier": s["tier"]}
+        for s in sources
+    ]
 
     prompt = DEEP_USER_PROMPT_TEMPLATE.format(
         prompt_version=PROMPT_VERSION_DEEP,
@@ -987,15 +1152,17 @@ async def run_deep(asset: str, ticker: str, company: str, conviction: str, force
         company=company,
         conviction=conviction_norm,
         now_iso=now_iso(),
-        context_sources_json=context_sources_json,
-        context_excerpts_json=context_excerpts_json,
+        context_sources_json=safe_json_dumps(prompt_sources),
+        context_excerpts_json=safe_json_dumps(excerpts),
     )
 
     try:
-        out = await gemini_generate_json(prompt, GEMINI_MAX_TOKENS_DEEP, schema=DEEP_SCHEMA)
-    except GeminiError as e:
-        raise HTTPException(status_code=502, detail=f"LLM error: {str(e)}")
+        out = await gemini_generate_json(prompt, max_tokens=GEMINI_MAX_TOKENS_DEEP, schema=DEEP_SCHEMA)
+    except Exception as e:
+        logger.exception("Gemini deep failed")
+        out = fallback_deep(asset, ticker, company, conviction_norm, reason=str(e)[:180])
 
+    # hard-fill
     out["prompt_version"] = PROMPT_VERSION_DEEP
     out["asset"] = asset
     out["ticker"] = ticker
@@ -1006,6 +1173,14 @@ async def run_deep(asset: str, ticker: str, company: str, conviction: str, force
     out = filter_sources_to_allowed(out, sources)
     ensure_three_questions(out, "counter_questions", conviction_norm)
 
+    if isinstance(out.get("evidences"), list) and len(out["evidences"]) > 5:
+        out["evidences"] = out["evidences"][:5]
+    if not isinstance(out.get("evidences"), list):
+        out["evidences"] = []
+
+    if not isinstance(out.get("sources_top"), list):
+        out["sources_top"] = []
+
     await cache.set(ckey, safe_json_dumps(out), CACHE_TTL_SECONDS)
     return out
 
@@ -1013,6 +1188,11 @@ async def run_deep(asset: str, ticker: str, company: str, conviction: str, force
 # =========================================================
 # Routes
 # =========================================================
+@app.get("/")
+async def root():
+    return {"ok": True, "name": APP_NAME}
+
+
 @app.get("/health")
 async def health():
     return {
@@ -1025,6 +1205,7 @@ async def health():
         "has_brave_key": bool(BRAVE_API_KEY),
         "time": now_iso(),
     }
+
 
 @app.post("/v1/analyze")
 async def analyze(req: AnalyzeRequest):
@@ -1045,6 +1226,12 @@ async def analyze(req: AnalyzeRequest):
         logger.exception("analyze failed")
         raise HTTPException(status_code=500, detail=f"Internal error: {type(e).__name__}: {str(e)[:200]}")
 
+
+@app.post("/v1/short-report")
+async def short_report(req: AnalyzeRequest):
+    return await analyze(req)
+
+
 @app.post("/v1/deep-report")
 async def deep_report(req: DeepReportRequest):
     ticker = req.ticker.strip()
@@ -1064,15 +1251,10 @@ async def deep_report(req: DeepReportRequest):
         logger.exception("deep-report failed")
         raise HTTPException(status_code=500, detail=f"Internal error: {type(e).__name__}: {str(e)[:200]}")
 
-@app.post("/v1/short-report")
-async def short_report(req: AnalyzeRequest):
-    return await analyze(req)
 
 if __name__ == "__main__":
     import uvicorn
     port = env_int("PORT", 8000)
     uvicorn.run("main:app", host="0.0.0.0", port=port)
-
-
 
 

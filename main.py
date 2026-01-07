@@ -806,11 +806,23 @@ async def _gemini_generate_raw(user_prompt: str, max_tokens: int, schema: Option
     if schema is not None:
         generation["responseSchema"] = schema  # ✅ 중요: responseSchema
 
-    payload: Dict[str, Any] = {
-        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-        "generationConfig": generation,
-    }
+payload: Dict[str, Any] = {
+    "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+    "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+    "generationConfig": {
+        "temperature": GEMINI_TEMPERATURE,
+        "maxOutputTokens": max_tokens,
+        "candidateCount": 1,
+
+        # ✅ JSON 강제 (문서 예시 키)
+        "responseMimeType": "application/json",
+        "responseSchema": schema,
+
+        # ✅ (옵션) snake_case도 같이 넣어두면 문서/런타임 차이에도 안전
+        "response_mime_type": "application/json",
+        "response_schema": schema,
+    },
+}
 
     headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json", "User-Agent": USER_AGENT}
 

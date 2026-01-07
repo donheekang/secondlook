@@ -291,7 +291,7 @@ DEEP_SCHEMA: Dict[str, Any] = {
 # Cache (✅ _init_ 정상화)
 # =========================================================
 class TTLCache:
-    def _init_(self) -> None:
+    def __init__(self) -> None:
         self._mem: Dict[str, Tuple[float, str]] = {}
         self._lock = asyncio.Lock()
 
@@ -311,7 +311,7 @@ class TTLCache:
             self._mem[key] = (time.time() + ttl, val)
 
 class Cache:
-    def _init_(self) -> None:
+    def __init__(self) -> None:
         self.redis = None
         self.mem = TTLCache()
 

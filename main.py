@@ -107,32 +107,32 @@ KST = timezone(timedelta(hours=9))
 SYSTEM_PROMPT = """You are "THE SHORT" risk reviewer.
 
 Tone:
-•⁠  ⁠Cold, concise, decisive.
-•⁠  ⁠Attack the logic, not the person.
-•⁠  ⁠No profanity, insults, slurs, harassment.
-•⁠  ⁠No memes, no roleplay, no emojis.
+- Cold, concise, decisive.
+- Attack the logic, not the person.
+- No profanity, insults, slurs, harassment.
+- No memes, no roleplay, no emojis.
 
 Safety:
-•⁠  ⁠NOT investment advice. Do NOT tell the user to buy/sell/short/hold.
-•⁠  ⁠Do NOT claim certainty. Use evidence and verification.
+- NOT investment advice. Do NOT tell the user to buy/sell/short/hold.
+- Do NOT claim certainty. Use evidence and verification.
 
 Truthfulness (critical):
-•⁠  ⁠Use ONLY facts found in CONTEXT_EXCERPTS_JSON.
-•⁠  ⁠Do NOT invent numbers, dates, events, or sources.
-•⁠  ⁠If a needed number is missing, explicitly state it is missing and use next_metric.
+- Use ONLY facts found in CONTEXT_EXCERPTS_JSON.
+- Do NOT invent numbers, dates, events, or sources.
+- If a needed number is missing, explicitly state it is missing and use next_metric.
 
 Output:
-•⁠  ⁠Return ONLY valid JSON (no markdown, no extra text).
-•⁠  ⁠Follow the provided JSON schema exactly.
+- Return ONLY valid JSON (no markdown, no extra text).
+- Follow the provided JSON schema exactly.
 """
 
 SHORT_USER_PROMPT_TEMPLATE = """TASK:
 Generate a "Short Report" in Korean as valid JSON.
 
 Hard rules:
-•⁠  ⁠Use ONLY facts from CONTEXT_EXCERPTS_JSON. No fabrication.
-•⁠  ⁠If evidence is missing, say it is missing and ask for verification via next_metric.
-•⁠  ⁠Questions must reference or quote the user's conviction_original.
+- Use ONLY facts from CONTEXT_EXCERPTS_JSON. No fabrication.
+- If evidence is missing, say it is missing and ask for verification via next_metric.
+- Questions must reference or quote the user's conviction_original.
 
 INPUT:
 prompt_version = "{prompt_version}"
@@ -169,15 +169,15 @@ Hard rules:
 3) sources must be selected ONLY from CONTEXT_SOURCES_JSON.
 
 Questions:
-•⁠  ⁠Create exactly 3 counter_questions:
+- Create exactly 3 counter_questions:
   Q1: numeric threshold (반증 조건)
   Q2: time horizon / next check date (검증 시점)
   Q3: action plan (대응 계획)
-•⁠  ⁠Each must reference or quote a phrase from conviction_original.
+- Each must reference or quote a phrase from conviction_original.
 
 Ordering:
-•⁠  ⁠For US/KR: A -> B -> C -> D -> E (include 3~5)
-•⁠  ⁠For COIN: E -> A -> B -> D -> C (E mandatory)
+- For US/KR: A -> B -> C -> D -> E (include 3~5)
+- For COIN: E -> A -> B -> D -> C (E mandatory)
 
 INPUT:
 prompt_version = "{prompt_version}"
@@ -301,7 +301,7 @@ DEEP_SCHEMA: Dict[str, Any] = {
 
 
 # =========================================================
-# Cache ✅ (FIXED _init_)
+# Cache ✅ (FIXED __init__)
 # =========================================================
 class TTLCache:
     def __init__(self) -> None:
@@ -666,7 +666,7 @@ def dedup_and_rank_sources(asset: str, raw_hits: List[Dict[str, Any]], limit: in
 # =========================================================
 async def fetch_text(client: httpx.AsyncClient, sem: asyncio.Semaphore, url: str) -> Tuple[str, Optional[str]]:
     async with sem:
-        r = await client.get(url, headers={"Accept": "/"})
+        r = await client.get(url, headers={"Accept": "*/*"})
         ctype = r.headers.get("content-type")
         data = r.content[:MAX_FETCH_BYTES]
 
@@ -732,8 +732,8 @@ class GeminiError(Exception):
 
 def _strip_code_fences(s: str) -> str:
     s = s.strip()
-    if s.startswith("⁠  "):
-        s = re.sub(r"^  ⁠[a-zA-Z0-9_-]\s", "", s)
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", s)
         s = re.sub(r"\s*```$", "", s)
     return s.strip()
 
@@ -1043,7 +1043,7 @@ async def analyze(req: AnalyzeRequest):
         raise
     except Exception as e:
         logger.exception("analyze failed")
-        raise HTTPException(status_code=500, detail=f"Internal error: {type(e)._name_}: {str(e)[:200]}")
+        raise HTTPException(status_code=500, detail=f"Internal error: {type(e).__name__}: {str(e)[:200]}")
 
 @app.post("/v1/deep-report")
 async def deep_report(req: DeepReportRequest):
@@ -1062,7 +1062,7 @@ async def deep_report(req: DeepReportRequest):
         raise
     except Exception as e:
         logger.exception("deep-report failed")
-        raise HTTPException(status_code=500, detail=f"Internal error: {type(e)._name_}: {str(e)[:200]}")
+        raise HTTPException(status_code=500, detail=f"Internal error: {type(e).__name__}: {str(e)[:200]}")
 
 @app.post("/v1/short-report")
 async def short_report(req: AnalyzeRequest):
@@ -1072,3 +1072,5 @@ if __name__ == "__main__":
     import uvicorn
     port = env_int("PORT", 8000)
     uvicorn.run("main:app", host="0.0.0.0", port=port)
+
+

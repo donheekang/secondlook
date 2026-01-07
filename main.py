@@ -821,7 +821,6 @@ payload: Dict[str, Any] = {
         # ✅ (옵션) snake_case도 같이 넣어두면 문서/런타임 차이에도 안전
         "response_mime_type": "application/json",
         "response_schema": schema,
-    },
 }
 
     headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json", "User-Agent": USER_AGENT}

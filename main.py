@@ -11,11 +11,11 @@ from datetime import datetime, timezone, timedelta
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# Optional deps (installed in requirements.txt, but keep safe)
+# Optional deps
 try:
     import redis.asyncio as redis  # type: ignore
 except Exception:
@@ -35,7 +35,7 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 
 # =========================================================
-# Safe env helpers (Render에서 빈 값/오타로 죽는 거 방지)
+# Safe env helpers
 # =========================================================
 def env_str(name: str, default: str = "") -> str:
     v = os.getenv(name)
@@ -69,20 +69,20 @@ def env_float(name: str, default: float) -> float:
 APP_NAME = "THE SHORT API"
 
 PROMPT_VERSION_SHORT = env_str("PROMPT_VERSION_SHORT", "short.v1.0")
-PROMPT_VERSION_DEEP = env_str("PROMPT_VERSION_DEEP", "deep.v1.0")
-RETRIEVAL_VERSION = env_str("RETRIEVAL_VERSION", "r1")
+PROMPT_VERSION_DEEP  = env_str("PROMPT_VERSION_DEEP",  "deep.v1.0")
+RETRIEVAL_VERSION    = env_str("RETRIEVAL_VERSION",    "r1")
 
 CACHE_TTL_SECONDS = env_int("CACHE_TTL_SECONDS", 86400)  # 24h
 
 SEARCH_PROVIDER = env_str("SEARCH_PROVIDER", "serper").lower()
-SERPER_API_KEY = env_str("SERPER_API_KEY", "")
-BRAVE_API_KEY = env_str("BRAVE_API_KEY", "")
+SERPER_API_KEY  = env_str("SERPER_API_KEY", "")
+BRAVE_API_KEY   = env_str("BRAVE_API_KEY", "")
 
 GEMINI_API_KEY = env_str("GEMINI_API_KEY", "")
-GEMINI_MODEL = env_str("GEMINI_MODEL", "gemini-3-flash-preview")
+GEMINI_MODEL   = env_str("GEMINI_MODEL", "gemini-3-flash-preview")
 GEMINI_TEMPERATURE = env_float("GEMINI_TEMPERATURE", 0.2)
 GEMINI_MAX_TOKENS_SHORT = env_int("GEMINI_MAX_TOKENS_SHORT", 1600)
-GEMINI_MAX_TOKENS_DEEP = env_int("GEMINI_MAX_TOKENS_DEEP", 3200)
+GEMINI_MAX_TOKENS_DEEP  = env_int("GEMINI_MAX_TOKENS_DEEP",  3200)
 
 REDIS_URL = env_str("REDIS_URL", "")
 
@@ -91,6 +91,7 @@ MAX_SOURCES = env_int("MAX_SOURCES", 12)
 MAX_EXCERPTS_PER_SOURCE = env_int("MAX_EXCERPTS_PER_SOURCE", 4)
 MAX_TOTAL_EXCERPTS = env_int("MAX_TOTAL_EXCERPTS", 48)
 MAX_FETCH_BYTES = env_int("MAX_FETCH_BYTES", 800_000)
+
 HTTP_TIMEOUT = env_float("HTTP_TIMEOUT", 12.0)
 
 ALLOWED_ORIGINS = env_str("ALLOWED_ORIGINS", "*")
@@ -99,10 +100,6 @@ USER_AGENT = env_str(
     "USER_AGENT",
     "Mozilla/5.0 (compatible; TheShortBot/1.0; +https://secondlook.onrender.com)"
 )
-
-# Optional endpoint protection (네가 Render에 SERVER_API_KEY 넣어두면 iOS도 헤더 보내야 함)
-SERVER_API_KEY = env_str("SERVER_API_KEY", "")
-
 
 # =========================================================
 # Prompts
@@ -160,7 +157,7 @@ A: 수요/성장 (Revenue/Demand)
 B: 마진/현금흐름 (Profitability/Cash Flow)
 C: 경쟁/가격결정력 (Competition/Pricing Power)
 D: 규제/법/집행/운영 리스크 (Regulatory/Legal/Execution)
-E: 밸류/수급/공급/오버행 (Valuation/Supply/Overhang) — mandatory for COIN
+E: 밸류/수급/공급/오버행 (Valuation/Supply/Overhang) — considered for COIN
 
 Hard rules:
 1) Every evidence must directly challenge the user's conviction sentence.
@@ -178,7 +175,7 @@ Questions:
 
 Ordering:
 •⁠  ⁠For US/KR: A -> B -> C -> D -> E (include 3~5)
-•⁠  ⁠For COIN: E -> A -> B -> D -> C (E mandatory)
+•⁠  ⁠For COIN: E -> A -> B -> D -> C (E strongly recommended)
 
 INPUT:
 prompt_version = "{prompt_version}"
@@ -195,10 +192,8 @@ CONTEXT_EXCERPTS_JSON:
 {context_excerpts_json}
 """
 
-
 # =========================================================
-# JSON Schemas (Gemini structured outputs)
-# - responseMimeType/responseJsonSchema로 JSON 강제 → 파싱 실패/500 줄임
+# Schemas (optional structured output)
 # =========================================================
 SHORT_SCHEMA: Dict[str, Any] = {
     "type": "object",
@@ -293,7 +288,7 @@ DEEP_SCHEMA: Dict[str, Any] = {
 
 
 # =========================================================
-# FastAPI + lifespan (startup에서 redis 연결)
+# Cache (✅ _init_ 정상화)
 # =========================================================
 class TTLCache:
     def _init_(self) -> None:
@@ -377,6 +372,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # =========================================================
 # Models
 # =========================================================
@@ -390,15 +386,6 @@ class AnalyzeRequest(BaseModel):
 
 class DeepReportRequest(AnalyzeRequest):
     pass
-
-
-# =========================================================
-# Security dependency (optional)
-# =========================================================
-def require_api_key(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")) -> None:
-    if SERVER_API_KEY:
-        if not x_api_key or x_api_key.strip() != SERVER_API_KEY:
-            raise HTTPException(status_code=401, detail="Missing/invalid X-API-Key")
 
 
 # =========================================================
@@ -453,7 +440,7 @@ def is_probably_pdf(url: str, content_type: Optional[str]) -> bool:
 
 
 # =========================================================
-# Sentence selection (simple heuristic)
+# Sentence selection
 # =========================================================
 def split_sentences(text: str) -> List[str]:
     t = text.replace("\r", "\n")
@@ -501,7 +488,7 @@ def score_sentence(sentence: str, asset: str) -> Tuple[float, List[str], str]:
     KW_C = ["경쟁", "점유율", "가격", "단가", "asp", "pricing", "competition", "market share", "rival"]
     KW_D = ["규제", "제재", "조사", "소송", "벌금", "당국", "sec", "fss", "금감원", "lawsuit", "fine", "regulation"]
     KW_E_stock = ["밸류", "per", "p/e", "ev/ebitda", "희석", "증자", "오버행", "buyback", "dilution", "valuation", "multiple"]
-    KW_E_coin = ["fdv", "유통", "총공급", "max supply", "unlock", "vesting", "인플레", "supply", "emission", "락업", "언락"]
+    KW_E_coin  = ["fdv", "유통", "총공급", "max supply", "unlock", "vesting", "인플레", "supply", "emission", "락업", "언락"]
 
     slot_scores: Dict[str, float] = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0, "E": 0.0}
 
@@ -744,8 +731,6 @@ async def build_excerpts(asset: str, sources: List[Dict[str, Any]]) -> List[Dict
 
 # =========================================================
 # Gemini call (REST)
-# - x-goog-api-key 헤더 사용 (공식 문서 예시) 
-# - responseMimeType/responseJsonSchema로 JSON 강제 
 # =========================================================
 class GeminiError(Exception):
     pass
@@ -766,7 +751,14 @@ async def gemini_generate_json(user_prompt: str, max_tokens: int, schema: Dict[s
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
-    payload: Dict[str, Any] = {
+    headers = {
+        "x-goog-api-key": GEMINI_API_KEY,
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+
+    # 1) Structured output 시도 (지원 안되면 fallback)
+    payload_structured: Dict[str, Any] = {
         "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
         "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
         "generationConfig": {
@@ -778,16 +770,24 @@ async def gemini_generate_json(user_prompt: str, max_tokens: int, schema: Dict[s
         },
     }
 
-    headers = {
-        "x-goog-api-key": GEMINI_API_KEY,
-        "Content-Type": "application/json",
-        "User-Agent": USER_AGENT,
-    }
-
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT * 2) as client:
-        r = await client.post(url, headers=headers, json=payload)
+        r = await client.post(url, headers=headers, json=payload_structured)
+        if r.status_code == 400:
+            # fallback: schema 미지원 가능성
+            payload_fallback: Dict[str, Any] = {
+                "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+                "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+                "generationConfig": {
+                    "temperature": GEMINI_TEMPERATURE,
+                    "maxOutputTokens": max_tokens,
+                    "candidateCount": 1,
+                },
+            }
+            r = await client.post(url, headers=headers, json=payload_fallback)
+
         if r.status_code >= 400:
             raise GeminiError(f"Gemini HTTP {r.status_code}: {r.text[:500]}")
+
         data = r.json()
 
     try:
@@ -799,7 +799,7 @@ async def gemini_generate_json(user_prompt: str, max_tokens: int, schema: Dict[s
 
 
 # =========================================================
-# Post-validate sources (no hallucinated urls)
+# Post-validate sources
 # =========================================================
 def filter_sources_to_allowed(obj: Dict[str, Any], allowed_sources: List[Dict[str, Any]]) -> Dict[str, Any]:
     allowed_urls = {s["url"] for s in allowed_sources}
@@ -983,12 +983,12 @@ async def health():
         "search_provider": SEARCH_PROVIDER,
         "has_serper_key": bool(SERPER_API_KEY),
         "has_brave_key": bool(BRAVE_API_KEY),
-        "has_server_api_key": bool(SERVER_API_KEY),
+        "has_gemini_key": bool(GEMINI_API_KEY),
         "time": now_iso(),
     }
 
 @app.post("/v1/analyze")
-async def analyze(req: AnalyzeRequest, _=Depends(require_api_key)):
+async def analyze(req: AnalyzeRequest):
     ticker = req.ticker.strip()
     company = (req.company or "Unknown").strip()
     conviction_norm = normalize_conviction(req.conviction)
@@ -1004,10 +1004,10 @@ async def analyze(req: AnalyzeRequest, _=Depends(require_api_key)):
         raise
     except Exception as e:
         logger.exception("analyze failed")
-        raise HTTPException(status_code=500, detail=f"Internal error: {type(e)._name_}")
+        raise HTTPException(status_code=500, detail=f"Internal error: {type(e)._name_}: {str(e)}")
 
 @app.post("/v1/deep-report")
-async def deep_report(req: DeepReportRequest, _=Depends(require_api_key)):
+async def deep_report(req: DeepReportRequest):
     ticker = req.ticker.strip()
     company = (req.company or "Unknown").strip()
     conviction_norm = normalize_conviction(req.conviction)
@@ -1023,11 +1023,12 @@ async def deep_report(req: DeepReportRequest, _=Depends(require_api_key)):
         raise
     except Exception as e:
         logger.exception("deep-report failed")
-        raise HTTPException(status_code=500, detail=f"Internal error: {type(e)._name_}")
+        raise HTTPException(status_code=500, detail=f"Internal error: {type(e)._name_}: {str(e)}")
 
 @app.post("/v1/short-report")
-async def short_report(req: AnalyzeRequest, _=Depends(require_api_key)):
+async def short_report(req: AnalyzeRequest):
     return await analyze(req)
+
 
 if __name__ == "__main__":
     import uvicorn

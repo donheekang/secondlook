@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -78,6 +78,9 @@ RETRIEVAL_VERSION = env_str("RETRIEVAL_VERSION", "r2-baseline")
 CACHE_TTL_SECONDS = env_int("CACHE_TTL_SECONDS", 86400)  # 24h
 FAIL_TTL_SECONDS = env_int("FAIL_TTL_SECONDS", 120)      # 실패 결과는 2분만 캐시
 
+# ✅ 실시간 가격 캐시(폴링 비용/레이트리밋 방어)
+PRICE_CACHE_TTL_SECONDS = env_int("PRICE_CACHE_TTL_SECONDS", 30)  # 30s default
+
 # 최소 excerpt가 이 개수보다 적으면 LLM 호출 안 하고 fallback으로 내려줌(비용/안정성)
 MIN_EXCERPTS_FOR_LLM = env_int("MIN_EXCERPTS_FOR_LLM", 4)
 
@@ -115,6 +118,11 @@ BLOCKED_FETCH_DOMAINS = {
     "marketwatch.com",
     "linkedin.com",
 }
+
+# ✅ 실시간 가격 조회 키들
+TWELVE_DATA_API_KEY = env_str("TWELVE_DATA_API_KEY", "")
+UPBIT_ACCESS_KEY = env_str("UPBIT_ACCESS_KEY", "")   # public ticker 조회엔 없어도 됨
+UPBIT_SECRET_KEY = env_str("UPBIT_SECRET_KEY", "")   # public ticker 조회엔 없어도 됨
 
 KST = timezone(timedelta(hours=9))
 
@@ -196,6 +204,12 @@ Rules:
 2) sources must be selected ONLY from CONTEXT_SOURCES_JSON.
 3) Create exactly 3 counter_questions (numeric threshold / check date / action plan)
    and each must reference or quote a phrase from conviction_original.
+
+Output style constraint (IMPORTANT):
+- Each evidence MUST be a "1-axis card":
+  title: 1 line
+  fact_line: 1 line (must include a number if available)
+  detail: exactly 2 short lines max (supporting facts, no long essay)
 
 Ordering:
 - For US/KR: A -> B -> C -> D -> E (include 3~5)
@@ -428,6 +442,17 @@ class DeepReportRequest(AnalyzeRequest):
     pass
 
 
+class PriceResponse(BaseModel):
+    asset: str
+    ticker: str
+    price: float
+    currency: str
+    as_of: str
+    source: str
+    cache_hit: bool
+    delayed: bool = False
+
+
 # =========================================================
 # Utils
 # =========================================================
@@ -463,6 +488,11 @@ def sha256_hex(s: str) -> str:
 def cache_key(endpoint: str, asset: str, ticker: str, conviction_norm: str, prompt_version: str) -> str:
     raw = f"{endpoint}|{asset}|{ticker}|{conviction_norm}|{prompt_version}|{GEMINI_MODEL}|{RETRIEVAL_VERSION}"
     return "th:" + sha256_hex(raw)
+
+
+def cache_key_price(asset: str, ticker: str) -> str:
+    raw = f"price|{asset}|{ticker}|twelvedata|upbit"
+    return "thp:" + sha256_hex(raw)
 
 
 def safe_json_dumps(obj: Any) -> str:
@@ -1213,6 +1243,12 @@ async def retrieve_context(asset: str, ticker: str, company: str) -> Tuple[List[
     return sources, excerpts
 
 
+def only_official_news_sources(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    # ✅ “SHORT에서 OFFICIAL/NEWS만 노출” = tier 기준 primary/reputable
+    # (없으면 빈 리스트가 될 수 있어 fallback 처리에 대비)
+    return [s for s in sources if s.get("tier") in ("primary", "reputable")]
+
+
 async def run_short(asset: str, ticker: str, company: str, conviction: str, force_refresh: bool) -> Dict[str, Any]:
     conviction_norm = normalize_conviction(conviction)
     ckey = cache_key("short", asset, ticker, conviction_norm, PROMPT_VERSION_SHORT)
@@ -1282,7 +1318,10 @@ async def run_short(asset: str, ticker: str, company: str, conviction: str, forc
     out["conviction_original"] = conviction_norm
     out["as_of"] = out.get("as_of") or now_iso()
 
-    out = filter_sources_to_allowed(out, sources)
+    # ✅ SHORT에서는 OFFICIAL/NEWS만 보이게 "표시용 소스" 제한
+    short_display_sources = only_official_news_sources(sources)
+    allowed_for_short = short_display_sources if short_display_sources else sources  # 없으면 어쩔 수 없이 전체 허용
+    out = filter_sources_to_allowed(out, allowed_for_short)
     ensure_three_questions(out, "questions", conviction_norm)
 
     # sources 비었으면 blindspot sources로 채우기
@@ -1295,6 +1334,19 @@ async def run_short(asset: str, ticker: str, company: str, conviction: str, forc
 
     await cache.set(ckey, safe_json_dumps(out), CACHE_TTL_SECONDS)
     return out
+
+
+def _trim_to_two_lines(text: str) -> str:
+    # Deep evidence detail을 2줄로 제한(너가 원하는 1축 구조 강제용)
+    t = (text or "").strip()
+    if not t:
+        return ""
+    # 줄바꿈/불릿을 기준으로 자르고, 최대 2줄만 유지
+    parts = [p.strip(" -•\t") for p in re.split(r"\n+|•\s*|- \s*", t) if p.strip()]
+    if not parts:
+        return t[:240]
+    parts = parts[:2]
+    return "\n".join(parts)
 
 
 async def run_deep(asset: str, ticker: str, company: str, conviction: str, force_refresh: bool) -> Dict[str, Any]:
@@ -1368,14 +1420,98 @@ async def run_deep(asset: str, ticker: str, company: str, conviction: str, force
     out = filter_sources_to_allowed(out, sources)
     ensure_three_questions(out, "counter_questions", conviction_norm)
 
-    # evidences max 5 방어
+    # evidences max 5 방어 + detail 2줄 강제
     if isinstance(out.get("evidences"), list) and len(out["evidences"]) > 5:
         out["evidences"] = out["evidences"][:5]
     if not isinstance(out.get("evidences"), list):
         out["evidences"] = []
 
+    for ev in out.get("evidences", []):
+        if isinstance(ev, dict):
+            ev["detail"] = _trim_to_two_lines(ev.get("detail", ""))
+
     await cache.set(ckey, safe_json_dumps(out), CACHE_TTL_SECONDS)
     return out
+
+
+# =========================================================
+# Realtime price fetchers (Twelve Data / Upbit)
+# =========================================================
+async def fetch_twelvedata_price(symbol: str) -> Tuple[float, str]:
+    if not TWELVE_DATA_API_KEY:
+        raise HTTPException(status_code=500, detail="TWELVE_DATA_API_KEY is missing")
+
+    url = "https://api.twelvedata.com/price"
+    params = {"symbol": symbol, "apikey": TWELVE_DATA_API_KEY}
+
+    try:
+        async with httpx.AsyncClient(timeout=min(8.0, HTTP_TIMEOUT), headers={"User-Agent": USER_AGENT}) as client:
+            r = await client.get(url, params=params)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"TwelveData request failed: {e}")
+
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"TwelveData bad status {r.status_code}: {r.text[:400]}")
+
+    data = r.json()
+    price_str = data.get("price")
+    if not price_str:
+        # TwelveData 에러 포맷도 섞여나옴: {"code":..., "message":...}
+        raise HTTPException(status_code=502, detail=f"TwelveData unexpected response: {data}")
+
+    try:
+        return float(price_str), "USD"
+    except Exception:
+        raise HTTPException(status_code=502, detail=f"TwelveData price parse failed: {data}")
+
+
+async def fetch_upbit_price(ticker_or_market: str) -> Tuple[float, str, str]:
+    # ticker가 BTC면 KRW-BTC로 변환
+    t = ticker_or_market.upper().strip()
+    market = t if "-" in t else f"KRW-{t}"
+
+    url = "https://api.upbit.com/v1/ticker"
+    params = {"markets": market}
+
+    try:
+        async with httpx.AsyncClient(timeout=min(8.0, HTTP_TIMEOUT), headers={"User-Agent": USER_AGENT}) as client:
+            r = await client.get(url, params=params)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Upbit request failed: {e}")
+
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Upbit bad status {r.status_code}: {r.text[:400]}")
+
+    arr = r.json()
+    if not isinstance(arr, list) or not arr:
+        raise HTTPException(status_code=502, detail=f"Upbit unexpected response: {arr}")
+
+    obj = arr[0]
+    trade_price = obj.get("trade_price")
+    if trade_price is None:
+        raise HTTPException(status_code=502, detail=f"Upbit missing trade_price: {obj}")
+
+    return float(trade_price), "KRW", market
+
+
+async def get_cached_price(asset: str, ticker: str) -> Optional[Dict[str, Any]]:
+    k = cache_key_price(asset, ticker)
+    v = await cache.get(k)
+    if not v:
+        return None
+    try:
+        obj = json.loads(v)
+        if isinstance(obj, dict):
+            obj["cache_hit"] = True
+            return obj
+    except Exception:
+        return None
+    return None
+
+
+async def set_cached_price(asset: str, ticker: str, payload: Dict[str, Any]) -> None:
+    k = cache_key_price(asset, ticker)
+    await cache.set(k, safe_json_dumps(payload), PRICE_CACHE_TTL_SECONDS)
 
 
 # =========================================================
@@ -1392,8 +1528,66 @@ async def health():
         "has_serper_key": bool(SERPER_API_KEY),
         "has_brave_key": bool(BRAVE_API_KEY),
         "min_excerpts_for_llm": MIN_EXCERPTS_FOR_LLM,
+        "has_twelvedata_key": bool(TWELVE_DATA_API_KEY),
+        "has_upbit_keys": bool(UPBIT_ACCESS_KEY) and bool(UPBIT_SECRET_KEY),
+        "price_cache_ttl_seconds": PRICE_CACHE_TTL_SECONDS,
         "time": now_iso(),
     }
+
+
+@app.get("/v1/price", response_model=PriceResponse)
+async def price(
+    asset: str = Query(..., description="US|COIN|KR (KR은 MVP에서 미지원 권장)"),
+    ticker: str = Query(..., description="TSLA / BTC / KRW-BTC 등"),
+    force_refresh: bool = Query(False),
+):
+    a = asset.strip().upper()
+    t = ticker.strip().upper()
+
+    if a not in ("US", "KR", "COIN"):
+        raise HTTPException(status_code=400, detail="asset must be US|KR|COIN")
+
+    if not t:
+        raise HTTPException(status_code=400, detail="ticker is required")
+
+    # 캐시
+    if not force_refresh:
+        cached = await get_cached_price(a, t)
+        if cached:
+            return cached
+
+    if a == "US":
+        px, cur = await fetch_twelvedata_price(t)
+        payload = {
+            "asset": a,
+            "ticker": t,
+            "price": px,
+            "currency": cur,
+            "as_of": now_iso(),
+            "source": "twelvedata",
+            "cache_hit": False,
+            "delayed": False,
+        }
+        await set_cached_price(a, t, payload)
+        return payload
+
+    if a == "COIN":
+        px, cur, market = await fetch_upbit_price(t)
+        payload = {
+            "asset": a,
+            "ticker": t,  # 앱에서 보낸 ticker 유지(BTC)
+            "price": px,
+            "currency": cur,  # Upbit는 KRW 기준
+            "as_of": now_iso(),
+            "source": f"upbit:{market}",
+            "cache_hit": False,
+            "delayed": False,
+        }
+        await set_cached_price(a, t, payload)
+        return payload
+
+    # KR (주식) 실시간은 보통 계약/유료/API 제약이 커서 MVP에서는 막는 게 안전
+    raise HTTPException(status_code=400, detail="Realtime KR stock price is not supported in MVP")
 
 
 @app.post("/v1/analyze")

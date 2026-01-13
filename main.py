@@ -13,7 +13,6 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import Query
 from pydantic import BaseModel, Field
 
 # Optional deps
@@ -79,8 +78,8 @@ RETRIEVAL_VERSION = env_str("RETRIEVAL_VERSION", "r2-baseline")
 CACHE_TTL_SECONDS = env_int("CACHE_TTL_SECONDS", 86400)  # 24h
 FAIL_TTL_SECONDS = env_int("FAIL_TTL_SECONDS", 120)      # 실패 결과는 2분만 캐시
 
-# ✅ QUOTE 캐시 (폴링 대응)
-QUOTE_CACHE_TTL_SECONDS = env_int("QUOTE_CACHE_TTL_SECONDS", 5)
+# ✅ 실시간 시세 캐시 (폴링 보호)
+QUOTE_CACHE_TTL_SECONDS = env_int("QUOTE_CACHE_TTL_SECONDS", 3)  # 3초 캐시
 
 # 최소 excerpt가 이 개수보다 적으면 LLM 호출 안 하고 fallback으로 내려줌(비용/안정성)
 MIN_EXCERPTS_FOR_LLM = env_int("MIN_EXCERPTS_FOR_LLM", 4)
@@ -430,18 +429,11 @@ class DeepReportRequest(AnalyzeRequest):
     pass
 
 
-# ✅ Quote Response (항상 200 + JSON)
-class QuoteResponse(BaseModel):
-    asset: str
-    ticker: str
-    as_of: str
-    price: Optional[float] = None
-    currency: Optional[str] = None
-    change: Optional[float] = None
-    change_percent: Optional[float] = None
-    market_time: Optional[str] = None
-    source: Optional[str] = None
-    error: Optional[str] = None
+# ✅ 실시간 시세 요청 (GET/POST 둘 다 지원)
+class QuoteRequest(BaseModel):
+    ticker: str = Field(..., min_length=1, max_length=32)
+    asset: Optional[str] = Field(default=None, description="US|KR|COIN")
+    force_refresh: bool = Field(default=False)
 
 
 # =========================================================
@@ -481,10 +473,9 @@ def cache_key(endpoint: str, asset: str, ticker: str, conviction_norm: str, prom
     return "th:" + sha256_hex(raw)
 
 
-# ✅ quote 캐시 키
 def quote_cache_key(asset: str, ticker: str) -> str:
-    raw = f"quote|{asset}|{ticker}"
-    return "thq:" + sha256_hex(raw)
+    raw = f"quote|{asset}|{ticker}|{RETRIEVAL_VERSION}"
+    return "th:" + sha256_hex(raw)
 
 
 def safe_json_dumps(obj: Any) -> str:
@@ -502,6 +493,149 @@ def is_probably_pdf(url: str, content_type: Optional[str]) -> bool:
     if content_type and "pdf" in content_type.lower():
         return True
     return False
+
+
+def _to_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def _epoch_to_iso_kst(epoch_sec: Any) -> Optional[str]:
+    try:
+        if epoch_sec is None:
+            return None
+        sec = int(epoch_sec)
+        dt = datetime.fromtimestamp(sec, tz=timezone.utc).astimezone(KST)
+        return dt.isoformat(timespec="seconds")
+    except Exception:
+        return None
+
+
+# =========================================================
+# ✅ Quote fetchers (Upbit for COIN, Yahoo Finance for US/KR)
+# =========================================================
+async def fetch_upbit_quote(ticker: str) -> Dict[str, Any]:
+    sym = ticker.strip().upper()
+    if not sym:
+        raise ValueError("ticker empty")
+
+    # Upbit market: KRW-BTC
+    market = sym
+    if not market.startswith("KRW-"):
+        market = f"KRW-{market}"
+
+    url = "https://api.upbit.com/v1/ticker"
+    params = {"markets": market}
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT}) as client:
+        r = await client.get(url, params=params)
+        r.raise_for_status()
+        data = r.json()
+
+    if not isinstance(data, list) or not data:
+        raise RuntimeError("upbit: empty response")
+
+    q = data[0]
+    price = _to_float(q.get("trade_price"))
+    change = _to_float(q.get("signed_change_price"))
+    rate = _to_float(q.get("signed_change_rate"))  # ratio
+    ts_ms = q.get("timestamp")
+    market_time = None
+    try:
+        if ts_ms is not None:
+            market_time = _epoch_to_iso_kst(int(ts_ms) // 1000)
+    except Exception:
+        market_time = None
+
+    return {
+        "symbol": market,
+        "price": price,
+        "currency": "KRW",
+        "change": change,
+        "change_percent": (rate * 100.0) if rate is not None else None,
+        "source": "upbit",
+        "market_time": market_time or now_iso(),
+    }
+
+
+async def fetch_yahoo_quote(symbols: List[str]) -> Optional[Dict[str, Any]]:
+    # Yahoo quote endpoint (no key)
+    url = "https://query1.finance.yahoo.com/v7/finance/quote"
+    params = {"symbols": ",".join(symbols)}
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=headers) as client:
+        r = await client.get(url, params=params)
+
+    if r.status_code >= 400:
+        return None
+
+    data = r.json()
+    results = (((data.get("quoteResponse") or {}).get("result")) or [])
+    if not results:
+        return None
+
+    # 첫 번째로 "가격 있는" 애 선택
+    chosen = None
+    for it in results:
+        if it.get("regularMarketPrice") is not None:
+            chosen = it
+            break
+    if chosen is None:
+        chosen = results[0]
+
+    price = _to_float(chosen.get("regularMarketPrice"))
+    change = _to_float(chosen.get("regularMarketChange"))
+    chg_pct = _to_float(chosen.get("regularMarketChangePercent"))
+    currency = (chosen.get("currency") or "").strip() or None
+    mtime = _epoch_to_iso_kst(chosen.get("regularMarketTime"))
+    symbol_used = (chosen.get("symbol") or "").strip() or None
+
+    return {
+        "symbol": symbol_used or (symbols[0] if symbols else None),
+        "price": price,
+        "currency": currency,
+        "change": change,
+        "change_percent": chg_pct,
+        "source": "yahoo",
+        "market_time": mtime,
+    }
+
+
+async def fetch_quote(asset: str, ticker: str) -> Dict[str, Any]:
+    a = asset.upper()
+    t = ticker.strip().upper()
+    if not t:
+        raise ValueError("ticker empty")
+
+    if a == "COIN":
+        return await fetch_upbit_quote(t)
+
+    if a == "US":
+        # TSLA, NVDA ...
+        out = await fetch_yahoo_quote([t])
+        if out is None:
+            raise RuntimeError("yahoo quote failed")
+        return out
+
+    # KR
+    # Yahoo는 005930.KS / 035720.KS / 코스닥은 .KQ
+    if re.fullmatch(r"\d{6}", t):
+        out = await fetch_yahoo_quote([f"{t}.KS"])
+        if out is None or out.get("price") is None:
+            out = await fetch_yahoo_quote([f"{t}.KQ"])
+        if out is None:
+            raise RuntimeError("yahoo quote failed")
+        return out
+
+    # 사용자가 이미 suffix 포함해서 넣은 케이스도 지원
+    out = await fetch_yahoo_quote([t])
+    if out is None:
+        raise RuntimeError("yahoo quote failed")
+    return out
 
 
 # =========================================================
@@ -828,7 +962,6 @@ async def build_excerpts(asset: str, sources: List[Dict[str, Any]]) -> List[Dict
 
             out_local: List[Dict[str, Any]] = []
 
-            # 1) 본문에서 문장 추출
             if text and not is_probably_pdf(url, ctype):
                 sents = split_sentences(text)
                 scored: List[Tuple[float, str, List[str], str]] = []
@@ -847,7 +980,6 @@ async def build_excerpts(asset: str, sources: List[Dict[str, Any]]) -> List[Dict
                         }
                     )
 
-            # 2) 본문이 막혔거나 빈약하면 snippet을 보강
             if len(out_local) == 0:
                 sn = _snippet_as_excerpt(src)
                 if sn:
@@ -870,7 +1002,6 @@ async def build_excerpts(asset: str, sources: List[Dict[str, Any]]) -> List[Dict
             continue
         out.extend(ch)
 
-    # 숫자 포함 excerpt 우선
     out.sort(key=lambda e: (-(1 if re.search(r"\d", e.get("excerpt", "")) else 0), e.get("source_id", "")))
     return out[:MAX_TOTAL_EXCERPTS]
 
@@ -934,7 +1065,6 @@ def _extract_first_json_block(s: str) -> Optional[str]:
 
 
 def parse_json_strict(text: str) -> Dict[str, Any]:
-    # 비표준 토큰 방어
     text = re.sub(r"\bNaN\b", "0", text)
     text = re.sub(r"\bInfinity\b", "0", text)
     text = re.sub(r"\b-Infinity\b", "0", text)
@@ -1045,7 +1175,6 @@ async def _gemini_generate_via_text_json(
     try:
         data = await _gemini_post(payload)
     except GeminiError as e:
-        # schema 미지원/엄격 오류면 schema 없이 1회 재시도
         if schema is not None:
             logger.warning("Gemini text-json schema failed. Retrying without schema. (%s)", str(e)[:200])
             payload["generationConfig"].pop("responseSchema", None)
@@ -1072,19 +1201,16 @@ async def gemini_generate_json(
     schema: Dict[str, Any],
     fn_name: str,
 ) -> Dict[str, Any]:
-    # 1) function calling (가장 안정)
     try:
         return await _gemini_generate_via_function_call(user_prompt, max_tokens, schema, fn_name)
     except Exception as e:
         logger.warning("Function calling failed, fallback to text-json: %s", str(e)[:200])
 
-    # 2) text-json
     try:
         return await _gemini_generate_via_text_json(user_prompt, max_tokens, schema=schema)
     except Exception:
         pass
 
-    # 3) repair 1회
     repair_prompt = (
         "You MUST output ONLY valid JSON. No markdown. No extra text.\n\n"
         f"INPUT:\n{user_prompt}\n\nOUTPUT: JSON only."
@@ -1112,7 +1238,6 @@ def filter_sources_to_allowed(obj: Dict[str, Any], allowed_sources: List[Dict[st
             url = (x.get("url") or "").strip()
             if url in allowed_urls:
                 out.append({"title": url_to_title.get(url, x.get("title", "") or ""), "url": url})
-        # dedupe
         seen = set()
         uniq = []
         for s in out:
@@ -1220,7 +1345,6 @@ def make_fallback_deep(asset: str, ticker: str, company: str, conviction: str, r
 # Retrieval pipeline
 # =========================================================
 async def retrieve_context(asset: str, ticker: str, company: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    # 키 없으면 검색 불가
     if SEARCH_PROVIDER == "serper" and not SERPER_API_KEY:
         return [], []
     if SEARCH_PROVIDER == "brave" and not BRAVE_API_KEY:
@@ -1396,163 +1520,6 @@ async def run_deep(asset: str, ticker: str, company: str, conviction: str, force
 
 
 # =========================================================
-# ✅ Quote providers (Yahoo / Upbit)
-# =========================================================
-async def _fetch_yahoo_quote(symbol: str) -> Optional[Dict[str, Any]]:
-    url = "https://query1.finance.yahoo.com/v7/finance/quote"
-    params = {"symbols": symbol}
-    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
-        r = await client.get(url, params=params, headers=headers)
-        if r.status_code >= 400:
-            return None
-        data = r.json()
-
-    result = ((data.get("quoteResponse") or {}).get("result") or [])
-    if not result:
-        return None
-
-    q = result[0]
-    price = q.get("regularMarketPrice")
-    if price is None:
-        price = q.get("postMarketPrice") or q.get("preMarketPrice")
-    if price is None:
-        return None
-
-    currency = q.get("currency") or q.get("financialCurrency")
-    change = q.get("regularMarketChange")
-    chg_pct = q.get("regularMarketChangePercent")
-
-    mt = q.get("regularMarketTime")
-    market_time = None
-    if isinstance(mt, (int, float)) and mt > 0:
-        market_time = datetime.fromtimestamp(mt, tz=timezone.utc).isoformat(timespec="seconds")
-
-    return {
-        "price": float(price),
-        "currency": str(currency) if currency else None,
-        "change": float(change) if isinstance(change, (int, float)) else None,
-        "change_percent": float(chg_pct) if isinstance(chg_pct, (int, float)) else None,
-        "market_time": market_time,
-        "source": "yahoo",
-    }
-
-
-def _yahoo_symbol_candidates(asset: str, ticker: str) -> List[str]:
-    t = ticker.strip().upper()
-    if asset == "US":
-        return [t]
-    if asset == "KR":
-        # 이미 suffix가 붙어온 경우도 수용
-        if t.endswith(".KS") or t.endswith(".KQ"):
-            return [t]
-        # 6자리 숫자면 KOSPI(.KS) → 실패 시 KOSDAQ(.KQ)
-        if re.fullmatch(r"\d{6}", t):
-            return [f"{t}.KS", f"{t}.KQ"]
-        return [t]
-    return [t]
-
-
-async def _fetch_upbit_quote(ticker: str) -> Optional[Dict[str, Any]]:
-    # Upbit KRW 마켓 가정 (앱에서도 COIN=₩)
-    up = ticker.strip().upper()
-    market = up
-    if not market.startswith("KRW-"):
-        market = "KRW-" + market
-
-    url = "https://api.upbit.com/v1/ticker"
-    params = {"markets": market}
-    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
-        r = await client.get(url, params=params, headers=headers)
-        if r.status_code >= 400:
-            return None
-        data = r.json()
-
-    if not isinstance(data, list) or not data:
-        return None
-    q = data[0]
-
-    price = q.get("trade_price")
-    if price is None:
-        return None
-
-    change = q.get("signed_change_price")
-    chg_rate = q.get("signed_change_rate")  # fraction (e.g. 0.0123)
-
-    mt = q.get("timestamp")  # ms
-    market_time = None
-    if isinstance(mt, (int, float)) and mt > 0:
-        market_time = datetime.fromtimestamp(mt / 1000.0, tz=timezone.utc).isoformat(timespec="seconds")
-
-    return {
-        "price": float(price),
-        "currency": "KRW",
-        "change": float(change) if isinstance(change, (int, float)) else None,
-        "change_percent": float(chg_rate) * 100.0 if isinstance(chg_rate, (int, float)) else None,
-        "market_time": market_time,
-        "source": "upbit",
-    }
-
-
-async def run_quote(asset: str, ticker: str, force_refresh: bool) -> QuoteResponse:
-    a = infer_asset(asset, ticker)
-    t = ticker.strip().upper()
-    ckey = quote_cache_key(a, t)
-
-    if not force_refresh:
-        cached = await cache.get(ckey)
-        if cached:
-            try:
-                return QuoteResponse.model_validate_json(cached)
-            except Exception:
-                pass
-
-    base = QuoteResponse(asset=a, ticker=t, as_of=now_iso())
-
-    try:
-        if a == "COIN":
-            q = await _fetch_upbit_quote(t)
-            if not q:
-                base.error = "quote fetch failed (upbit)"
-            else:
-                base.price = q.get("price")
-                base.currency = q.get("currency")
-                base.change = q.get("change")
-                base.change_percent = q.get("change_percent")
-                base.market_time = q.get("market_time")
-                base.source = q.get("source")
-        else:
-            # US/KR → Yahoo
-            candidates = _yahoo_symbol_candidates(a, t)
-            hit = None
-            for sym in candidates:
-                hit = await _fetch_yahoo_quote(sym)
-                if hit:
-                    break
-            if not hit:
-                base.error = "quote fetch failed (yahoo)"
-            else:
-                base.price = hit.get("price")
-                base.currency = hit.get("currency")
-                base.change = hit.get("change")
-                base.change_percent = hit.get("change_percent")
-                base.market_time = hit.get("market_time")
-                base.source = hit.get("source")
-
-    except Exception as e:
-        base.error = f"quote exception: {type(e).__name__}"
-
-    # cache (짧게)
-    try:
-        await cache.set(ckey, base.model_dump_json(), QUOTE_CACHE_TTL_SECONDS)
-    except Exception:
-        pass
-
-    return base
-
-
-# =========================================================
 # Routes
 # =========================================================
 @app.get("/health")
@@ -1566,19 +1533,66 @@ async def health():
         "has_serper_key": bool(SERPER_API_KEY),
         "has_brave_key": bool(BRAVE_API_KEY),
         "min_excerpts_for_llm": MIN_EXCERPTS_FOR_LLM,
-        "quote_ttl": QUOTE_CACHE_TTL_SECONDS,
+        "quote_cache_ttl_seconds": QUOTE_CACHE_TTL_SECONDS,
         "time": now_iso(),
     }
 
 
-# ✅ 새 엔드포인트: 실시간 현재가
+# ✅ 실시간 시세 GET
 @app.get("/v1/quote")
-async def quote(
-    asset: str = Query("US", description="US|KR|COIN"),
-    ticker: str = Query(..., min_length=1, max_length=20),
-    force_refresh: bool = Query(False),
-):
-    return await run_quote(asset=asset, ticker=ticker, force_refresh=force_refresh)
+async def quote_get(ticker: str, asset: Optional[str] = None, force_refresh: bool = False):
+    req = QuoteRequest(ticker=ticker, asset=asset, force_refresh=force_refresh)
+    return await quote_post(req)
+
+
+# ✅ 실시간 시세 POST (iOS에서 POST로 쓰고 싶으면 이걸로)
+@app.post("/v1/quote")
+async def quote_post(req: QuoteRequest):
+    t = req.ticker.strip().upper()
+    a = infer_asset(req.asset, t)
+
+    ckey = quote_cache_key(a, t)
+    if not req.force_refresh:
+        cached = await cache.get(ckey)
+        if cached:
+            return json.loads(cached)
+
+    try:
+        q = await fetch_quote(a, t)
+        out = {
+            "ok": True,
+            "as_of": now_iso(),
+            "asset": a,
+            "ticker": t,
+            "symbol": q.get("symbol"),
+            "price": q.get("price"),
+            "currency": q.get("currency"),
+            "change": q.get("change"),
+            "change_percent": q.get("change_percent"),
+            "source": q.get("source"),
+            "market_time": q.get("market_time"),
+            "error": None,
+        }
+        await cache.set(ckey, safe_json_dumps(out), QUOTE_CACHE_TTL_SECONDS)
+        return out
+    except Exception as e:
+        logger.warning("quote failed: %s", str(e)[:200])
+        out = {
+            "ok": False,
+            "as_of": now_iso(),
+            "asset": a,
+            "ticker": t,
+            "symbol": None,
+            "price": None,
+            "currency": None,
+            "change": None,
+            "change_percent": None,
+            "source": None,
+            "market_time": None,
+            "error": f"{type(e).__name__}: {str(e)[:200]}",
+        }
+        await cache.set(ckey, safe_json_dumps(out), FAIL_TTL_SECONDS)
+        return out
 
 
 @app.post("/v1/analyze")
